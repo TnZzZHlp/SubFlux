@@ -1,0 +1,411 @@
+use std::{path::PathBuf, sync::Arc};
+
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
+use tracing::debug;
+
+use crate::{
+    config::{Config, LanguageCode},
+    error::{AppError, Result},
+    event::TaskEvent,
+    media::{TrackIndex, plan_audio_chunks, probe_duration, probe_media},
+    output::build_output_path,
+    services::Services,
+    stt::SttInput,
+    subtitle::{EmbeddedSubtitleSource, ExternalSubtitleSource, SubtitleDocument, SubtitleSource},
+};
+
+use super::{
+    stt::{ChunkedSttResults, document_from_stt_result},
+    subtitle::{TranslationContext, translate_document},
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubtitleInput {
+    Auto,
+    Embedded(TrackIndex),
+    External(PathBuf),
+    Stt,
+}
+
+#[derive(Clone, Debug)]
+pub struct PipelineJob {
+    /// Optional only for a standalone external subtitle source.
+    pub video: Option<PathBuf>,
+    pub input: SubtitleInput,
+    pub source_language: LanguageCode,
+    pub target_language: LanguageCode,
+    pub config: Config,
+}
+
+impl PipelineJob {
+    pub fn external_subtitle_path(&self) -> Option<&std::path::Path> {
+        match &self.input {
+            SubtitleInput::External(path) => Some(path),
+            SubtitleInput::Auto | SubtitleInput::Embedded(_) | SubtitleInput::Stt => None,
+        }
+    }
+
+    fn video_required(&self) -> Result<&std::path::Path> {
+        self.video.as_deref().ok_or_else(|| {
+            AppError::InvalidConfig("a video path is required for embedded subtitles or STT".into())
+        })
+    }
+}
+
+pub async fn run_pipeline(
+    job: PipelineJob,
+    services: Arc<Services>,
+    cancellation: CancellationToken,
+    events: UnboundedSender<TaskEvent>,
+) -> Result<PathBuf> {
+    check_cancelled(&cancellation)?;
+    let mut document = load_document(&job, &services, &cancellation, &events).await?;
+    check_cancelled(&cancellation)?;
+    translate_document(
+        &mut document,
+        TranslationContext {
+            source_language: &job.source_language,
+            target_language: &job.target_language,
+            chunk_size: job.config.translator.chunk_size,
+            context_before: job.config.translator.context_before,
+            context_after: job.config.translator.context_after,
+            max_retries: job.config.translator.max_retries,
+            translator: services.translator.as_ref(),
+            cancellation: &cancellation,
+            events: &events,
+        },
+    )
+    .await?;
+    check_cancelled(&cancellation)?;
+
+    let output = build_output_path(
+        job.video.as_deref(),
+        job.external_subtitle_path(),
+        &job.target_language,
+        document.format,
+    )?;
+    send(&events, TaskEvent::Writing);
+    let output = services
+        .subtitle_writer
+        .write(&document, &output, job.config.output_overwrite)
+        .await?;
+    debug!(output = %output.display(), "subtitle translation pipeline completed");
+    Ok(output)
+}
+
+async fn load_document(
+    job: &PipelineJob,
+    services: &Services,
+    cancellation: &CancellationToken,
+    events: &UnboundedSender<TaskEvent>,
+) -> Result<SubtitleDocument> {
+    match &job.input {
+        SubtitleInput::External(path) => {
+            send(events, TaskEvent::ExtractingSubtitle);
+            ExternalSubtitleSource::new(path).load().await
+        }
+        SubtitleInput::Stt => load_stt_document(job, services, cancellation, events).await,
+        SubtitleInput::Auto | SubtitleInput::Embedded(_) => {
+            let video = job.video_required()?;
+            send(events, TaskEvent::Probing);
+            let probe = probe_media(video).await?;
+            send(events, TaskEvent::TracksLoaded(probe.clone()));
+            let track = match job.input {
+                SubtitleInput::Auto => probe.auto_track().cloned(),
+                SubtitleInput::Embedded(index) => probe.track(index).cloned(),
+                SubtitleInput::External(_) | SubtitleInput::Stt => unreachable!(),
+            };
+            match track {
+                Some(track) if track.is_text() => {
+                    send(events, TaskEvent::ExtractingSubtitle);
+                    EmbeddedSubtitleSource::new(
+                        video,
+                        track,
+                        services.ffmpeg.clone(),
+                        cancellation.clone(),
+                    )
+                    .load()
+                    .await
+                }
+                Some(track) => Err(AppError::UnsupportedSubtitleCodec(format!(
+                    "{}：当前字幕轨为图像字幕，不支持直接翻译。请选择 STT 模式。",
+                    track.codec
+                ))),
+                None if matches!(job.input, SubtitleInput::Auto) => {
+                    // Auto's documented fallback: no usable text track means STT.
+                    load_stt_document(job, services, cancellation, events).await
+                }
+                None => Err(AppError::ProbeFailed(
+                    "selected subtitle track no longer exists in this video".into(),
+                )),
+            }
+        }
+    }
+}
+
+async fn load_stt_document(
+    job: &PipelineJob,
+    services: &Services,
+    cancellation: &CancellationToken,
+    events: &UnboundedSender<TaskEvent>,
+) -> Result<SubtitleDocument> {
+    let video = job.video_required()?;
+    send(events, TaskEvent::Probing);
+    let duration = probe_duration(video).await?;
+    let chunks = plan_audio_chunks(
+        duration,
+        job.config.stt.chunk_seconds,
+        job.config.stt.chunk_overlap_seconds,
+    );
+    if chunks.is_empty() {
+        return Err(AppError::SttError(
+            "media has no audio duration available for speech recognition".into(),
+        ));
+    }
+    let language = if job.source_language != LanguageCode::auto() {
+        Some(job.source_language.clone())
+    } else if job.config.stt.language != LanguageCode::auto() {
+        Some(job.config.stt.language.clone())
+    } else {
+        None
+    };
+    let stt = services
+        .stt
+        .as_ref()
+        .ok_or(AppError::MissingConfiguration("STT_API_KEY"))?;
+    let total = chunks.len();
+    let mut results = ChunkedSttResults::default();
+    for (index, chunk) in chunks.iter().enumerate() {
+        check_cancelled(cancellation)?;
+        send(events, TaskEvent::ExtractingAudio);
+        let audio = services
+            .ffmpeg
+            .extract_audio_chunk(video, chunk, cancellation)
+            .await?;
+        check_cancelled(cancellation)?;
+        send(
+            events,
+            TaskEvent::SttStarted {
+                current: index,
+                total,
+            },
+        );
+        let result = stt
+            .transcribe(
+                SttInput {
+                    audio_path: audio.path().to_path_buf(),
+                    language: language.clone(),
+                },
+                cancellation,
+            )
+            .await?;
+        results.absorb(result, chunk);
+        send(
+            events,
+            TaskEvent::SttProgress {
+                current: index + 1,
+                total: Some(total),
+            },
+        );
+    }
+    document_from_stt_result(results.finish())
+}
+
+fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn send(sender: &UnboundedSender<TaskEvent>, event: TaskEvent) {
+    let _ = sender.send(event);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use async_trait::async_trait;
+    use tokio::process::Command;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use crate::{
+        config::LanguageCode,
+        media::{Ffmpeg, check_tools},
+        services::Services,
+        stt::{SttProvider, SttResult},
+        subtitle::{FileSubtitleWriter, SpeechSegment, SubtitleWriter},
+        translator::{TranslationItem, TranslationRequest, TranslationResponse, Translator},
+    };
+
+    use super::*;
+
+    struct MockTranslator;
+
+    struct FlacCheckingStt;
+
+    #[async_trait]
+    impl SttProvider for FlacCheckingStt {
+        async fn transcribe(
+            &self,
+            input: SttInput,
+            _cancellation: &CancellationToken,
+        ) -> Result<SttResult> {
+            assert_eq!(
+                input
+                    .audio_path
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("flac")
+            );
+            Ok(SttResult {
+                language: Some(LanguageCode::parse("ja").unwrap()),
+                segments: vec![SpeechSegment {
+                    start_ms: 100,
+                    end_ms: 900,
+                    text: "テスト".into(),
+                }],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Translator for MockTranslator {
+        async fn translate(
+            &self,
+            request: TranslationRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<TranslationResponse> {
+            Ok(TranslationResponse {
+                entries: request
+                    .segments
+                    .into_iter()
+                    .map(|entry| TranslationItem {
+                        id: entry.id,
+                        text: format!("译文: {}", entry.text),
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn external_ass_pipeline_writes_next_to_associated_video() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("movie.mkv");
+        let source = directory.path().join("movie.ja.ass");
+        tokio::fs::write(&video, []).await.unwrap();
+        tokio::fs::write(
+            &source,
+            concat!(
+                "[Script Info]\nTitle: untouched\n\n[Events]\n",
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+                "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\an8}hello\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let services = Arc::new(Services {
+            translator: Arc::new(MockTranslator),
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, mut received_events) = unbounded_channel();
+        let output = run_pipeline(
+            PipelineJob {
+                video: Some(video),
+                input: SubtitleInput::External(source),
+                source_language: LanguageCode::parse("en").unwrap(),
+                target_language: LanguageCode::parse("zh-CN").unwrap(),
+                config,
+            },
+            services,
+            CancellationToken::new(),
+            events,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, directory.path().join("movie.zh-CN.ass"));
+        let written = tokio::fs::read_to_string(&output).await.unwrap();
+        assert!(written.contains("Title: untouched"));
+        assert!(written.contains("{\\an8}译文: hello"));
+        assert!(received_events.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn stt_extracts_a_flac_fragment_before_transcribing() {
+        if !check_tools().is_ready() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("audio.mkv");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=2",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&video)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "fixture generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let job = PipelineJob {
+            video: Some(video),
+            input: SubtitleInput::Stt,
+            source_language: LanguageCode::auto(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            config,
+        };
+        let services = Services {
+            translator: Arc::new(MockTranslator),
+            stt: Some(Arc::new(FlacCheckingStt)),
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        };
+        let (events, mut received_events) = unbounded_channel();
+        let document = load_stt_document(&job, &services, &CancellationToken::new(), &events)
+            .await
+            .unwrap();
+
+        assert_eq!(document.entries.len(), 1);
+        assert_eq!(document.entries[0].translatable_text, "テスト");
+        assert!(matches!(received_events.try_recv(), Ok(TaskEvent::Probing)));
+        assert!(matches!(
+            received_events.try_recv(),
+            Ok(TaskEvent::ExtractingAudio)
+        ));
+        assert!(matches!(
+            received_events.try_recv(),
+            Ok(TaskEvent::SttStarted {
+                current: 0,
+                total: 1
+            })
+        ));
+        assert!(matches!(
+            received_events.try_recv(),
+            Ok(TaskEvent::SttProgress {
+                current: 1,
+                total: Some(1)
+            })
+        ));
+    }
+}
