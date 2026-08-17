@@ -164,13 +164,43 @@ fn send(sender: &UnboundedSender<TaskEvent>, event: TaskEvent) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, path::Path};
 
+    use async_trait::async_trait;
+    use tokio::process::Command;
     use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::{config::Config, subtitle::SubtitleOutputMode};
+    use crate::{
+        config::Config,
+        media::{Ffmpeg, check_tools},
+        services::Services,
+        subtitle::{FileSubtitleWriter, SubtitleOutputMode, SubtitleWriter},
+        translator::{TranslationItem, TranslationRequest, TranslationResponse, Translator},
+    };
 
     use super::*;
+
+    struct MockTranslator;
+
+    #[async_trait]
+    impl Translator for MockTranslator {
+        async fn translate(
+            &self,
+            request: TranslationRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<TranslationResponse> {
+            Ok(TranslationResponse {
+                entries: request
+                    .segments
+                    .into_iter()
+                    .map(|entry| TranslationItem {
+                        id: entry.id,
+                        text: format!("译文: {}", entry.text),
+                    })
+                    .collect(),
+            })
+        }
+    }
 
     #[test]
     fn each_batch_video_inherits_the_shared_options() {
@@ -256,5 +286,120 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn batch_translates_each_discovered_video_sequentially() {
+        if !check_tools().is_ready() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let first = create_video_with_subtitle(directory.path(), "first", "first source").await;
+        let second = create_video_with_subtitle(directory.path(), "second", "second source").await;
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let job = BatchJob {
+            videos: vec![first.clone(), second.clone()],
+            subtitle_input: BatchSubtitleInput::Auto,
+            source_language: LanguageCode::parse("en").unwrap(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
+            config,
+        };
+        let services = Arc::new(Services {
+            translator: Some(Arc::new(MockTranslator)),
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, mut received_events) = unbounded_channel();
+
+        let summary = run_batch(job, services, CancellationToken::new(), events)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.failed, Vec::<crate::event::BatchFailure>::new());
+        assert_eq!(
+            summary.succeeded,
+            vec![
+                directory.path().join("first.zh-CN.srt"),
+                directory.path().join("second.zh-CN.srt"),
+            ]
+        );
+        assert!(
+            tokio::fs::read_to_string(directory.path().join("first.zh-CN.srt"))
+                .await
+                .unwrap()
+                .contains("译文: first source")
+        );
+        assert!(
+            tokio::fs::read_to_string(directory.path().join("second.zh-CN.srt"))
+                .await
+                .unwrap()
+                .contains("译文: second source")
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| received_events.try_recv().ok()).collect();
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TaskEvent::BatchVideoStarted { video, .. } => Some(video.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec![first, second]);
+    }
+
+    async fn create_video_with_subtitle(directory: &Path, name: &str, text: &str) -> PathBuf {
+        let source = directory.join(format!("{name}.srt"));
+        let video = directory.join(format!("{name}.mkv"));
+        tokio::fs::write(
+            &source,
+            format!("1\n00:00:00,000 --> 00:00:00,800\n{text}\n"),
+        )
+        .await
+        .unwrap();
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=1",
+                "-i",
+            ])
+            .arg(&source)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:0",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "pcm_s16le",
+                "-c:s",
+                "srt",
+                "-shortest",
+            ])
+            .arg(&video)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "fixture generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        video
     }
 }
