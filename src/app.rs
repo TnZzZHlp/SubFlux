@@ -6,10 +6,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     action::Action,
     config::{Config, LanguageCode},
-    event::TaskEvent,
+    event::{BatchSummary, TaskEvent},
     media::{MediaProbe, ToolStatus, TrackIndex},
     output::build_output_path,
-    pipeline::{PipelineJob, SubtitleInput},
+    pipeline::{BatchJob, BatchSubtitleInput, PipelineJob, SubtitleInput},
     subtitle::{SubtitleFormat, SubtitleOutputMode},
 };
 
@@ -75,6 +75,7 @@ pub struct ProcessingState {
     pub total: Option<usize>,
     pub request: Option<usize>,
     pub errors: usize,
+    pub batch: Option<BatchProcessingState>,
 }
 
 impl Default for ProcessingState {
@@ -85,14 +86,25 @@ impl Default for ProcessingState {
             total: None,
             request: None,
             errors: 0,
+            batch: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BatchProcessingState {
+    pub current: usize,
+    pub total: usize,
+    pub current_video: Option<PathBuf>,
+    pub succeeded: usize,
+    pub failed: usize,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ResultState {
     pub output: Option<PathBuf>,
     pub error: Option<String>,
+    pub batch: Option<BatchSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +136,10 @@ pub enum Command {
     Probe(PathBuf),
     Start {
         job: Box<PipelineJob>,
+        cancellation: CancellationToken,
+    },
+    StartBatch {
+        job: Box<BatchJob>,
         cancellation: CancellationToken,
     },
     Cancel(CancellationToken),
@@ -167,15 +183,20 @@ impl App {
         }
     }
 
-    /// Provides startup-discovered videos to the TUI without changing the
-    /// existing one-video-at-a-time translation pipeline.
+    /// Stores recursively discovered videos for either individual selection or
+    /// an explicit sequential batch run.
     pub fn set_video_candidates(&mut self, videos: Vec<PathBuf>) {
         self.video_candidates = videos;
         self.video_cursor = 0;
         match self.video_candidates.len() {
-            0 => {}
+            0 => self.status_message = Some("未找到支持的视频文件。".into()),
             1 => self.select_video_candidate(),
-            _ => self.page = Page::Videos,
+            count => {
+                self.page = Page::Videos;
+                self.status_message = Some(format!(
+                    "已找到 {count} 个视频：按 B 连续处理全部，或按 Enter 选择单个视频。"
+                ));
+            }
         }
     }
 
@@ -208,6 +229,7 @@ impl App {
                 self.page = Page::Tracks;
                 Vec::new()
             }
+            KeyCode::Char('b') => self.start_batch_command(),
             KeyCode::Char('p') => self.probe_command(),
             KeyCode::Tab | KeyCode::Down => {
                 self.home_field = self.home_field.next(false);
@@ -272,6 +294,7 @@ impl App {
                 self.select_video_candidate();
                 Vec::new()
             }
+            KeyCode::Char('b') => self.start_batch_command(),
             KeyCode::Char('q') => vec![Command::Quit],
             _ => Vec::new(),
         }
@@ -333,19 +356,19 @@ impl App {
 
     fn handle_result_key(&mut self, key: KeyEvent) -> Vec<Command> {
         match key.code {
-            KeyCode::Up if self.result.error.is_some() => {
+            KeyCode::Up if self.result_has_details() => {
                 self.result_scroll = self.result_scroll.saturating_sub(1);
                 Vec::new()
             }
-            KeyCode::Down if self.result.error.is_some() => {
+            KeyCode::Down if self.result_has_details() => {
                 self.result_scroll = self.result_scroll.saturating_add(1);
                 Vec::new()
             }
-            KeyCode::PageUp if self.result.error.is_some() => {
+            KeyCode::PageUp if self.result_has_details() => {
                 self.result_scroll = self.result_scroll.saturating_sub(10);
                 Vec::new()
             }
-            KeyCode::PageDown if self.result.error.is_some() => {
+            KeyCode::PageDown if self.result_has_details() => {
                 self.result_scroll = self.result_scroll.saturating_add(10);
                 Vec::new()
             }
@@ -506,10 +529,14 @@ impl App {
     fn start_command(&mut self) -> Vec<Command> {
         if !self.tools.is_ready() {
             self.page = Page::Result;
-            self.result.error = Some(format!(
-                "所需媒体工具不可用，无法开始：{}",
-                self.tools.problems().join("; ")
-            ));
+            self.result = ResultState {
+                output: None,
+                error: Some(format!(
+                    "所需媒体工具不可用，无法开始：{}",
+                    self.tools.problems().join("; ")
+                )),
+                batch: None,
+            };
             return Vec::new();
         }
         let video =
@@ -558,6 +585,65 @@ impl App {
         }]
     }
 
+    fn start_batch_command(&mut self) -> Vec<Command> {
+        if !self.tools.is_ready() {
+            self.page = Page::Result;
+            self.result = ResultState {
+                output: None,
+                error: Some(format!(
+                    "所需媒体工具不可用，无法开始：{}",
+                    self.tools.problems().join("; ")
+                )),
+                batch: None,
+            };
+            return Vec::new();
+        }
+        if self.video_candidates.is_empty() {
+            self.status_message = Some(
+                "请先以文件夹作为启动路径，或在视频选择页发现至少一个视频后再批量处理。".into(),
+            );
+            return Vec::new();
+        }
+        let subtitle_input = match self.source_mode {
+            SourceMode::Auto => BatchSubtitleInput::Auto,
+            SourceMode::Stt => BatchSubtitleInput::Stt,
+            SourceMode::Embedded => {
+                self.status_message = Some(
+                    "批量处理不能复用单个视频的指定字幕轨。请选择“自动”或“语音识别（STT）”。"
+                        .into(),
+                );
+                return Vec::new();
+            }
+            SourceMode::External => {
+                self.status_message = Some(
+                    "批量处理不支持一个外部字幕路径对应多个视频。请选择“自动”或“语音识别（STT）”。"
+                        .into(),
+                );
+                return Vec::new();
+            }
+        };
+        let cancellation = CancellationToken::new();
+        let total = self.video_candidates.len();
+        let job = BatchJob {
+            videos: self.video_candidates.clone(),
+            subtitle_input,
+            source_language: self.source_language.clone(),
+            target_language: self.target_language.clone(),
+            output_mode: self.output_mode,
+            config: self.config.clone(),
+        };
+        self.processing = ProcessingState::default();
+        self.result = ResultState::default();
+        self.result_scroll = 0;
+        self.status_message = Some(format!("正在按发现顺序批量处理 {total} 个视频…"));
+        self.cancellation = Some(cancellation.clone());
+        self.page = Page::Processing;
+        vec![Command::StartBatch {
+            job: Box::new(job),
+            cancellation,
+        }]
+    }
+
     fn cancel_or_quit(&mut self) -> Vec<Command> {
         if let Some(cancellation) = self.cancellation.clone() {
             self.processing.stage = "正在取消…".into();
@@ -569,6 +655,71 @@ impl App {
 
     fn handle_task(&mut self, event: TaskEvent) -> Vec<Command> {
         match event {
+            TaskEvent::BatchStarted { total } => {
+                self.processing.batch = Some(BatchProcessingState {
+                    total,
+                    ..BatchProcessingState::default()
+                });
+                self.processing.stage = "正在准备批量任务…".into();
+            }
+            TaskEvent::BatchVideoStarted {
+                current,
+                total,
+                video,
+            } => {
+                let batch = self
+                    .processing
+                    .batch
+                    .get_or_insert_with(|| BatchProcessingState {
+                        total,
+                        ..BatchProcessingState::default()
+                    });
+                batch.current = current;
+                batch.total = total;
+                batch.current_video = Some(video);
+                self.processing.stage = format!("正在处理第 {current}/{total} 个视频…");
+                self.processing.completed = 0;
+                self.processing.total = None;
+                self.processing.request = None;
+            }
+            TaskEvent::BatchVideoSucceeded {
+                current,
+                total,
+                video,
+                output: _,
+            } => {
+                let batch = self
+                    .processing
+                    .batch
+                    .get_or_insert_with(|| BatchProcessingState {
+                        total,
+                        ..BatchProcessingState::default()
+                    });
+                batch.current = current;
+                batch.total = total;
+                batch.current_video = Some(video);
+                batch.succeeded += 1;
+            }
+            TaskEvent::BatchVideoFailed {
+                current,
+                total,
+                video,
+                error,
+            } => {
+                let batch = self
+                    .processing
+                    .batch
+                    .get_or_insert_with(|| BatchProcessingState {
+                        total,
+                        ..BatchProcessingState::default()
+                    });
+                batch.current = current;
+                batch.total = total;
+                batch.current_video = Some(video);
+                batch.failed += 1;
+                self.processing.errors += 1;
+                self.status_message = Some(format!("第 {current}/{total} 个视频处理失败：{error}"));
+            }
             TaskEvent::Probing => self.processing.stage = "正在探测媒体…".into(),
             TaskEvent::TracksLoaded(probe) => {
                 if self.selected_track.is_none() {
@@ -618,6 +769,17 @@ impl App {
                 self.result = ResultState {
                     output: Some(output),
                     error: None,
+                    batch: None,
+                };
+            }
+            TaskEvent::BatchFinished(summary) => {
+                self.cancellation = None;
+                self.page = Page::Result;
+                self.result_scroll = 0;
+                self.result = ResultState {
+                    output: None,
+                    error: None,
+                    batch: Some(summary),
                 };
             }
             TaskEvent::Failed(error) => {
@@ -627,6 +789,7 @@ impl App {
                 self.result = ResultState {
                     output: None,
                     error: Some(error),
+                    batch: None,
                 };
             }
             TaskEvent::Cancelled => {
@@ -636,6 +799,7 @@ impl App {
                 self.result = ResultState {
                     output: None,
                     error: Some("任务已取消。".into()),
+                    batch: None,
                 };
             }
             TaskEvent::ConfigReloaded(config) => {
@@ -718,6 +882,15 @@ impl App {
 
     pub const fn result_scroll(&self) -> u16 {
         self.result_scroll
+    }
+
+    fn result_has_details(&self) -> bool {
+        self.result.error.is_some()
+            || self
+                .result
+                .batch
+                .as_ref()
+                .is_some_and(|summary| !summary.failed.is_empty())
     }
 }
 
@@ -868,6 +1041,85 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert_eq!(app.page, Page::Videos);
+    }
+
+    #[test]
+    fn discovered_videos_can_start_a_sequential_batch() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        app.set_video_candidates(vec![
+            PathBuf::from("first.mp4"),
+            PathBuf::from("second.mkv"),
+        ]);
+
+        let commands = app.update(Action::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+
+        let [Command::StartBatch { job, .. }] = commands.as_slice() else {
+            panic!("expected a batch start command");
+        };
+        assert_eq!(
+            job.videos,
+            vec![PathBuf::from("first.mp4"), PathBuf::from("second.mkv")]
+        );
+        assert_eq!(job.subtitle_input, BatchSubtitleInput::Auto);
+        assert_eq!(app.page, Page::Processing);
+    }
+
+    #[test]
+    fn batch_rejects_sources_without_a_per_video_mapping() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        app.set_video_candidates(vec![
+            PathBuf::from("first.mp4"),
+            PathBuf::from("second.mkv"),
+        ]);
+        app.source_mode = SourceMode::External;
+
+        let commands = app.update(Action::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(commands.is_empty());
+        assert_eq!(app.page, Page::Videos);
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("不支持一个外部字幕路径"))
+        );
+    }
+
+    #[test]
+    fn batch_events_produce_a_summary_result() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        app.page = Page::Processing;
+
+        let started = app.update(Action::Task(Box::new(TaskEvent::BatchStarted { total: 2 })));
+        assert!(started.is_empty());
+        assert_eq!(
+            app.processing.batch.as_ref().map(|batch| batch.total),
+            Some(2)
+        );
+
+        let summary = BatchSummary {
+            total: 2,
+            succeeded: vec![PathBuf::from("first.zh-CN.srt")],
+            failed: vec![crate::event::BatchFailure {
+                video: PathBuf::from("second.mkv"),
+                error: "fixture failure".into(),
+            }],
+        };
+        let finished = app.update(Action::Task(Box::new(TaskEvent::BatchFinished(
+            summary.clone(),
+        ))));
+
+        assert!(finished.is_empty());
+        assert_eq!(app.page, Page::Result);
+        assert_eq!(app.result.batch, Some(summary));
     }
 
     #[test]

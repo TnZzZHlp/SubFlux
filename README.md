@@ -14,8 +14,8 @@ Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
 - Ratatui + Crossterm TUI: Home, Settings, subtitle-track selection,
   Processing, and Result/Error pages.
 - An optional startup path: a video path is prefilled directly, while a
-  directory is scanned recursively and opens a video-selection page when it
-  contains multiple supported videos.
+  directory is scanned recursively for supported videos. The selection page
+  can start a sequential batch over every discovered video.
 - Auto selection of the default text subtitle track, falling back to STT when
   no text track exists.
 - Manual selection of an embedded track, an external `.srt`, `.ass`, `.ssa`,
@@ -51,7 +51,7 @@ embedded/external subtitle or STT
         -> SubtitleDocument
         -> optional batched ID/text translation
         -> replace only subtitle text ranges
-        -> output-mode-specific subtitle file
+        -> <video>.<target-language>.<extension>
 ```
 
 The TUI never performs probing, extraction, HTTP calls, or writing during a
@@ -151,7 +151,8 @@ subtitle-translator
 # Start with one video already selected.
 subtitle-translator /media/movie.mkv
 
-# Recursively find videos under a directory, then choose one in the TUI.
+# Recursively find videos under a directory, then press B in the TUI to
+# translate every discovered video sequentially.
 subtitle-translator /media/series
 ```
 
@@ -161,13 +162,23 @@ so it works over SSH and in ordinary terminals.
 
 The startup argument accepts either one video file or one directory. Directory
 discovery recognizes common video extensions, sorts matches deterministically,
-and never follows directory symlinks. Selecting a video always continues the
-existing one-video-at-a-time workflow; it does not start a batch translation.
+and never follows directory symlinks. On the video-selection page, `B` runs
+all discovered videos in that order; `Enter` still selects one video for the
+existing single-video workflow. You can return to Home to adjust languages or
+output type before pressing `B`.
+
+Batch processing supports **Auto** (each video chooses its own default text
+track and falls back to STT) and explicit **STT**. A selected embedded-track
+index or one external subtitle path cannot safely apply to unrelated videos,
+so those modes are rejected for a batch. Each video is independent: a failure
+or an existing output is recorded and the next video continues. `C` or `Esc`
+cancels the current video and prevents later videos from starting.
 
 | Key | Action |
 | --- | --- |
 | `Tab`, `↑`, `↓` | Move between Home fields |
 | `←`, `→`, `Enter` | Cycle source, languages, or output type; activate the selected field |
+| `B` | Sequentially process every video discovered from a startup directory |
 | `P` | Probe video subtitle tracks |
 | `T` | Open Subtitle Track Selection |
 | `A` / `X` on track page | Choose Auto / STT |
@@ -204,13 +215,14 @@ the desired type before starting the task.
 
 STT produces SRT by default. A standalone subtitle such as `movie.ja.ass`
 becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs are
-protected unless `OUTPUT_OVERWRITE=true` is set.
+protected unless `OUTPUT_OVERWRITE=true` is set; a batch records an existing
+output as a failed video and continues with the remaining videos.
 
 ## Known limits in the first version
 
 - No hard-subtitle OCR, PGS OCR, VobSub OCR, or other image-subtitle OCR.
-- No GUI, web UI, WASM, database, directory batch translation, or video
-  re-encoding. A directory passed at startup is discovery and selection only.
+- No GUI, web UI, WASM, database, directory parallelism, or video
+  re-encoding. Directory batches run sequentially by design.
 - No subtitle burn-in, remuxing translated subtitles into a video, or video
   re-encoding.
 - STT chunks are processed sequentially and kept in memory until translation;

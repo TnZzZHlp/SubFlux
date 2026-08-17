@@ -66,6 +66,15 @@ pub async fn run_pipeline(
     check_cancelled(&cancellation)?;
     let mut document = load_document(&job, &services, &cancellation, &events).await?;
     check_cancelled(&cancellation)?;
+    let output = build_output_path(
+        job.video.as_deref(),
+        job.external_subtitle_path(),
+        &job.target_language,
+        document.format,
+    )?;
+    if output.exists() && !job.config.output_overwrite {
+        return Err(AppError::OutputExists(output));
+    }
     if job.output_mode.needs_translation() {
         let translator = services
             .translator
@@ -88,13 +97,6 @@ pub async fn run_pipeline(
         .await?;
     }
     check_cancelled(&cancellation)?;
-
-    let output = build_output_path(
-        job.video.as_deref(),
-        job.external_subtitle_path(),
-        &job.target_language,
-        document.format,
-    )?;
     send(&events, TaskEvent::Writing);
     let output = services
         .subtitle_writer

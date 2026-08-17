@@ -32,11 +32,15 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(
-        "↑/↓：选择  Enter：确认  Esc/H：返回首页  Q：退出",
+        "↑/↓：选择  Enter：确认单个  B：连续处理全部  Esc/H：返回首页  Q：退出",
     ));
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(" 视频选择 ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(" 视频选择 / 批量处理 ")
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );

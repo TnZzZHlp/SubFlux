@@ -19,7 +19,7 @@ use subflux::{
     error::AppError,
     event::TaskEvent,
     media::{check_tools, discover_videos, probe_media},
-    pipeline::run_pipeline,
+    pipeline::{run_batch, run_pipeline},
     services::Services,
     tui::{TuiTerminal, spawn_input},
 };
@@ -146,6 +146,35 @@ fn execute(command: Command, events: tokio::sync::mpsc::UnboundedSender<TaskEven
                     Err(error) => {
                         let message = error.safe_message();
                         error!(error = %message, "subtitle pipeline failed");
+                        let _ = events.send(TaskEvent::Failed(message));
+                    }
+                }
+            });
+            true
+        }
+        Command::StartBatch { job, cancellation } => {
+            tokio::spawn(async move {
+                let job = *job;
+                let services =
+                    match Services::from_config(&job.config, job.output_mode.needs_translation()) {
+                        Ok(services) => Arc::new(services),
+                        Err(error) => {
+                            let message = error.safe_message();
+                            error!(error = %message, "batch provider setup failed");
+                            let _ = events.send(TaskEvent::Failed(message));
+                            return;
+                        }
+                    };
+                match run_batch(job, services, cancellation, events.clone()).await {
+                    Ok(summary) => {
+                        let _ = events.send(TaskEvent::BatchFinished(summary));
+                    }
+                    Err(subflux::error::AppError::Cancelled) => {
+                        let _ = events.send(TaskEvent::Cancelled);
+                    }
+                    Err(error) => {
+                        let message = error.safe_message();
+                        error!(error = %message, "subtitle batch pipeline failed");
                         let _ = events.send(TaskEvent::Failed(message));
                     }
                 }

@@ -79,7 +79,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         row(HomeField::Start, "", "[ 开始处理 ]".into()),
         Line::raw(""),
         Line::from(
-            "Tab/↑/↓：切换字段  ←/→：切换来源/语言/输出类型  P：探测字幕轨  T：字幕轨  S：设置  Q：退出",
+            "Tab/↑/↓：切换字段  ←/→：切换来源/语言/输出类型  B：处理已发现视频  P：探测字幕轨  T：字幕轨  S：设置  Q：退出",
         ),
     ];
     let title = if app.tools.is_ready() {
