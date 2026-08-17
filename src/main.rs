@@ -126,15 +126,16 @@ fn execute(command: Command, events: tokio::sync::mpsc::UnboundedSender<TaskEven
         Command::Start { job, cancellation } => {
             tokio::spawn(async move {
                 let job = *job;
-                let services = match Services::from_config(&job.config) {
-                    Ok(services) => Arc::new(services),
-                    Err(error) => {
-                        let message = error.safe_message();
-                        error!(error = %message, "provider setup failed");
-                        let _ = events.send(TaskEvent::Failed(message));
-                        return;
-                    }
-                };
+                let services =
+                    match Services::from_config(&job.config, job.output_mode.needs_translation()) {
+                        Ok(services) => Arc::new(services),
+                        Err(error) => {
+                            let message = error.safe_message();
+                            error!(error = %message, "provider setup failed");
+                            let _ = events.send(TaskEvent::Failed(message));
+                            return;
+                        }
+                    };
                 match run_pipeline(job, services, cancellation, events.clone()).await {
                     Ok(output) => {
                         let _ = events.send(TaskEvent::Finished(output));

@@ -19,7 +19,7 @@ use std::path::Path;
 use crate::error::{AppError, Result};
 pub use model::{
     ByteRange, OriginalDocument, RawSubtitleEntry, SpeechSegment, SubtitleDocument, SubtitleEntry,
-    SubtitleFormat, SubtitleId, SubtitleMetadata,
+    SubtitleFormat, SubtitleId, SubtitleMetadata, SubtitleOutputMode,
 };
 pub use source::{EmbeddedSubtitleSource, ExternalSubtitleSource, SubtitleSource};
 pub use writer::{FileSubtitleWriter, SubtitleWriter};

@@ -10,7 +10,7 @@ use crate::{
     media::{MediaProbe, ToolStatus, TrackIndex},
     output::build_output_path,
     pipeline::{PipelineJob, SubtitleInput},
-    subtitle::SubtitleFormat,
+    subtitle::{SubtitleFormat, SubtitleOutputMode},
 };
 
 const SOURCE_LANGUAGES: &[&str] = &["auto", "ja", "en", "ko", "zh-CN", "zh-TW", "fr", "de", "es"];
@@ -42,17 +42,19 @@ pub enum HomeField {
     Track,
     SourceLanguage,
     TargetLanguage,
+    Output,
     Start,
 }
 
 impl HomeField {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Video,
         Self::Source,
         Self::ExternalSubtitle,
         Self::Track,
         Self::SourceLanguage,
         Self::TargetLanguage,
+        Self::Output,
         Self::Start,
     ];
 
@@ -108,6 +110,7 @@ pub struct App {
     pub track_cursor: usize,
     pub source_language: LanguageCode,
     pub target_language: LanguageCode,
+    pub output_mode: SubtitleOutputMode,
     pub home_field: HomeField,
     pub processing: ProcessingState,
     pub result: ResultState,
@@ -136,6 +139,7 @@ impl App {
             page: Page::Home,
             source_language: config.source_language.clone(),
             target_language: config.target_language.clone(),
+            output_mode: SubtitleOutputMode::default(),
             config,
             tools,
             video_path: String::new(),
@@ -378,6 +382,10 @@ impl App {
                 self.cycle_language(false, 1);
                 Vec::new()
             }
+            HomeField::Output => {
+                self.adjust_output_mode(1);
+                Vec::new()
+            }
             HomeField::Start => self.start_command(),
             HomeField::Video | HomeField::ExternalSubtitle => Vec::new(),
         }
@@ -400,6 +408,7 @@ impl App {
             HomeField::Source => self.adjust_source(direction),
             HomeField::SourceLanguage => self.cycle_language(true, direction),
             HomeField::TargetLanguage => self.cycle_language(false, direction),
+            HomeField::Output => self.adjust_output_mode(direction),
             _ => {}
         }
         Vec::new()
@@ -453,6 +462,24 @@ impl App {
         }
     }
 
+    fn adjust_output_mode(&mut self, direction: i8) {
+        let modes = [
+            SubtitleOutputMode::Translated,
+            SubtitleOutputMode::Bilingual,
+            SubtitleOutputMode::Original,
+        ];
+        let current = modes
+            .iter()
+            .position(|mode| *mode == self.output_mode)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            (current + modes.len() - 1) % modes.len()
+        } else {
+            (current + 1) % modes.len()
+        };
+        self.output_mode = modes[next];
+    }
+
     fn edit_current_text(&mut self, edit: impl FnOnce(&mut String)) {
         match self.home_field {
             HomeField::Video => edit(&mut self.video_path),
@@ -461,6 +488,7 @@ impl App {
             | HomeField::Track
             | HomeField::SourceLanguage
             | HomeField::TargetLanguage
+            | HomeField::Output
             | HomeField::Start => {}
         }
     }
@@ -516,6 +544,7 @@ impl App {
             input,
             source_language: self.source_language.clone(),
             target_language: self.target_language.clone(),
+            output_mode: self.output_mode,
             config: self.config.clone(),
         };
         self.processing = ProcessingState::default();
@@ -630,6 +659,14 @@ impl App {
         }
     }
 
+    pub const fn output_mode_label(&self) -> &'static str {
+        match self.output_mode {
+            SubtitleOutputMode::Translated => "仅译文",
+            SubtitleOutputMode::Bilingual => "双语对照（原文在前）",
+            SubtitleOutputMode::Original => "仅原文（跳过翻译）",
+        }
+    }
+
     pub fn selected_track_label(&self) -> String {
         self.selected_track
             .and_then(|index| self.tracks.track(index))
@@ -702,6 +739,39 @@ mod tests {
         )));
         assert!(matches!(commands.as_slice(), [Command::Start { .. }]));
         assert_eq!(app.page, Page::Processing);
+    }
+
+    #[test]
+    fn output_mode_cycles_and_is_attached_to_the_pipeline_job() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        app.video_path = "/tmp/movie.mkv".into();
+        app.home_field = HomeField::Output;
+
+        let commands = app.update(Action::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert!(commands.is_empty());
+        assert_eq!(app.output_mode, SubtitleOutputMode::Bilingual);
+        assert!(app.output_preview().ends_with("movie.zh-CN.srt"));
+
+        let _ = app.update(Action::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.output_mode, SubtitleOutputMode::Original);
+        assert!(app.output_preview().ends_with("movie.zh-CN.srt"));
+
+        app.home_field = HomeField::Start;
+        let commands = app.update(Action::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        let [Command::Start { job, .. }] = commands.as_slice() else {
+            panic!("expected a start command");
+        };
+        assert_eq!(job.output_mode, SubtitleOutputMode::Original);
     }
 
     #[test]

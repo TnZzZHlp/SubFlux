@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::error::{AppError, Result};
 
-use super::SubtitleDocument;
+use super::{SubtitleDocument, SubtitleOutputMode};
 
 #[async_trait]
 pub trait SubtitleWriter: Send + Sync {
@@ -15,6 +15,7 @@ pub trait SubtitleWriter: Send + Sync {
         &self,
         document: &SubtitleDocument,
         output: &Path,
+        output_mode: SubtitleOutputMode,
         overwrite: bool,
     ) -> Result<PathBuf>;
 }
@@ -28,12 +29,13 @@ impl SubtitleWriter for FileSubtitleWriter {
         &self,
         document: &SubtitleDocument,
         output: &Path,
+        output_mode: SubtitleOutputMode,
         overwrite: bool,
     ) -> Result<PathBuf> {
         if output.exists() && !overwrite {
             return Err(AppError::OutputExists(output.to_path_buf()));
         }
-        let content = document.render()?;
+        let content = document.render_with_mode(output_mode)?;
         let parent = output
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -69,7 +71,7 @@ pub type DynSubtitleWriter = Arc<dyn SubtitleWriter>;
 mod tests {
     use crate::{
         error::AppError,
-        subtitle::{SpeechSegment, SubtitleDocument},
+        subtitle::{SpeechSegment, SubtitleDocument, SubtitleOutputMode},
     };
 
     use super::*;
@@ -89,7 +91,10 @@ mod tests {
         .unwrap();
         document.entries[0].translated_text = Some("你好".into());
         let writer = FileSubtitleWriter;
-        writer.write(&document, &output, false).await.unwrap();
+        writer
+            .write(&document, &output, SubtitleOutputMode::Translated, false)
+            .await
+            .unwrap();
         assert!(
             tokio::fs::read_to_string(&output)
                 .await
@@ -97,7 +102,9 @@ mod tests {
                 .contains("你好")
         );
         assert!(matches!(
-            writer.write(&document, &output, false).await,
+            writer
+                .write(&document, &output, SubtitleOutputMode::Translated, false)
+                .await,
             Err(AppError::OutputExists(_))
         ));
     }

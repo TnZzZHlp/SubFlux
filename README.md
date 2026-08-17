@@ -3,8 +3,8 @@
 `subtitle-translator` is a Rust terminal UI for translating video subtitles.
 It first looks for a usable text subtitle track in the video; when there is no
 such track, or when STT is selected explicitly, it extracts audio, requests
-timestamped speech recognition, and translates the resulting segments. The
-translated subtitle is written next to the video.
+timestamped speech recognition, and optionally translates the resulting
+segments. The selected subtitle output is written next to the video.
 
 It uses `ffmpeg` and `ffprobe` as external programs. It does not link an FFmpeg
 Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
@@ -28,6 +28,9 @@ Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
   `serde`.
 - Strict ID-based batched translation responses, bounded retries, progress
   events, and cancellation with `C` or `Esc` on the Processing page.
+- Three output modes: translated text only, original-plus-translation
+  bilingual subtitles, or original text only. Original-only output skips
+  translator provider setup and requests.
 - Long-video STT extracts bounded 16 kHz mono FLAC fragments with overlapping
   boundaries, then restores their source timestamps before translation.
 - API-key masking in Settings and file-based `subtitle-translator.log` logging
@@ -46,9 +49,9 @@ terminal input -> Action -> App state -> Command/background task
 
 embedded/external subtitle or STT
         -> SubtitleDocument
-        -> batched ID/text translation
+        -> optional batched ID/text translation
         -> replace only subtitle text ranges
-        -> <video>.<target-language>.<extension>
+        -> output-mode-specific subtitle file
 ```
 
 The TUI never performs probing, extraction, HTTP calls, or writing during a
@@ -164,7 +167,7 @@ existing one-video-at-a-time workflow; it does not start a batch translation.
 | Key | Action |
 | --- | --- |
 | `Tab`, `↑`, `↓` | Move between Home fields |
-| `←`, `→`, `Enter` | Cycle source/languages or activate the selected field |
+| `←`, `→`, `Enter` | Cycle source, languages, or output type; activate the selected field |
 | `P` | Probe video subtitle tracks |
 | `T` | Open Subtitle Track Selection |
 | `A` / `X` on track page | Choose Auto / STT |
@@ -192,9 +195,16 @@ Existing subtitles preserve their format:
   -> /movie/movie.zh-CN.ass
 ```
 
+Home offers three output types. **Translated only** is the default.
+**Bilingual** puts the original line before its translation. **Original only**
+writes the extracted subtitle unchanged (or the STT transcript) and does not
+need a translator API key. STT still requires its own API key. All three use
+the same existing `<name>.<target-language>.<extension>` output name, so select
+the desired type before starting the task.
+
 STT produces SRT by default. A standalone subtitle such as `movie.ja.ass`
-becomes `movie.zh-CN.ass`. Existing outputs are protected unless
-`OUTPUT_OVERWRITE=true` is set.
+becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs are
+protected unless `OUTPUT_OVERWRITE=true` is set.
 
 ## Known limits in the first version
 

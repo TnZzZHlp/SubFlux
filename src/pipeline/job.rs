@@ -12,7 +12,10 @@ use crate::{
     output::build_output_path,
     services::Services,
     stt::SttInput,
-    subtitle::{EmbeddedSubtitleSource, ExternalSubtitleSource, SubtitleDocument, SubtitleSource},
+    subtitle::{
+        EmbeddedSubtitleSource, ExternalSubtitleSource, SubtitleDocument, SubtitleOutputMode,
+        SubtitleSource,
+    },
 };
 
 use super::{
@@ -35,6 +38,7 @@ pub struct PipelineJob {
     pub input: SubtitleInput,
     pub source_language: LanguageCode,
     pub target_language: LanguageCode,
+    pub output_mode: SubtitleOutputMode,
     pub config: Config,
 }
 
@@ -62,21 +66,27 @@ pub async fn run_pipeline(
     check_cancelled(&cancellation)?;
     let mut document = load_document(&job, &services, &cancellation, &events).await?;
     check_cancelled(&cancellation)?;
-    translate_document(
-        &mut document,
-        TranslationContext {
-            source_language: &job.source_language,
-            target_language: &job.target_language,
-            chunk_size: job.config.translator.chunk_size,
-            context_before: job.config.translator.context_before,
-            context_after: job.config.translator.context_after,
-            max_retries: job.config.translator.max_retries,
-            translator: services.translator.as_ref(),
-            cancellation: &cancellation,
-            events: &events,
-        },
-    )
-    .await?;
+    if job.output_mode.needs_translation() {
+        let translator = services
+            .translator
+            .as_deref()
+            .ok_or(AppError::MissingConfiguration("TRANSLATOR_API_KEY"))?;
+        translate_document(
+            &mut document,
+            TranslationContext {
+                source_language: &job.source_language,
+                target_language: &job.target_language,
+                chunk_size: job.config.translator.chunk_size,
+                context_before: job.config.translator.context_before,
+                context_after: job.config.translator.context_after,
+                max_retries: job.config.translator.max_retries,
+                translator,
+                cancellation: &cancellation,
+                events: &events,
+            },
+        )
+        .await?;
+    }
     check_cancelled(&cancellation)?;
 
     let output = build_output_path(
@@ -88,9 +98,14 @@ pub async fn run_pipeline(
     send(&events, TaskEvent::Writing);
     let output = services
         .subtitle_writer
-        .write(&document, &output, job.config.output_overwrite)
+        .write(
+            &document,
+            &output,
+            job.output_mode,
+            job.config.output_overwrite,
+        )
         .await?;
-    debug!(output = %output.display(), "subtitle translation pipeline completed");
+    debug!(output = %output.display(), "subtitle output pipeline completed");
     Ok(output)
 }
 
@@ -237,7 +252,7 @@ mod tests {
         media::{Ffmpeg, check_tools},
         services::Services,
         stt::{SttProvider, SttResult},
-        subtitle::{FileSubtitleWriter, SpeechSegment, SubtitleWriter},
+        subtitle::{FileSubtitleWriter, SpeechSegment, SubtitleOutputMode, SubtitleWriter},
         translator::{TranslationItem, TranslationRequest, TranslationResponse, Translator},
     };
 
@@ -310,7 +325,7 @@ mod tests {
         .unwrap();
         let config = Config::from_map(&HashMap::new()).unwrap();
         let services = Arc::new(Services {
-            translator: Arc::new(MockTranslator),
+            translator: Some(Arc::new(MockTranslator)),
             stt: None,
             subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
             ffmpeg: Arc::new(Ffmpeg),
@@ -322,6 +337,7 @@ mod tests {
                 input: SubtitleInput::External(source),
                 source_language: LanguageCode::parse("en").unwrap(),
                 target_language: LanguageCode::parse("zh-CN").unwrap(),
+                output_mode: SubtitleOutputMode::Translated,
                 config,
             },
             services,
@@ -335,6 +351,49 @@ mod tests {
         assert!(written.contains("Title: untouched"));
         assert!(written.contains("{\\an8}译文: hello"));
         assert!(received_events.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn original_output_writes_source_without_a_translator() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("movie.ja.srt");
+        let source_content = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
+        tokio::fs::write(&source, source_content).await.unwrap();
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let services = Arc::new(Services {
+            translator: None,
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, mut received_events) = unbounded_channel();
+        let output = run_pipeline(
+            PipelineJob {
+                video: None,
+                input: SubtitleInput::External(source),
+                source_language: LanguageCode::parse("en").unwrap(),
+                target_language: LanguageCode::parse("zh-CN").unwrap(),
+                output_mode: SubtitleOutputMode::Original,
+                config,
+            },
+            services,
+            CancellationToken::new(),
+            events,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, directory.path().join("movie.zh-CN.srt"));
+        assert_eq!(
+            tokio::fs::read_to_string(output).await.unwrap(),
+            source_content
+        );
+        let emitted: Vec<_> = std::iter::from_fn(|| received_events.try_recv().ok()).collect();
+        assert!(
+            emitted
+                .iter()
+                .all(|event| !matches!(event, TaskEvent::TranslationStarted { .. }))
+        );
     }
 
     #[tokio::test]
@@ -373,10 +432,11 @@ mod tests {
             input: SubtitleInput::Stt,
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
             config,
         };
         let services = Services {
-            translator: Arc::new(MockTranslator),
+            translator: Some(Arc::new(MockTranslator)),
             stt: Some(Arc::new(FlacCheckingStt)),
             subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
             ffmpeg: Arc::new(Ffmpeg),

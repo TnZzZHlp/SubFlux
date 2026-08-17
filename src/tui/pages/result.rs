@@ -13,7 +13,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         || {
             let error = app.result.error.as_deref().unwrap_or("未知错误");
             let mut lines = vec![
-                Line::from(Span::styled("翻译未完成", Style::default().fg(Color::Red))),
+                Line::from(Span::styled("处理未完成", Style::default().fg(Color::Red))),
                 Line::raw(""),
             ];
             lines.extend(error.lines().map(|line| Line::from(line.to_owned())));
@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         },
         |output| {
             vec![
-                Line::from(Span::styled("翻译完成", Style::default().fg(Color::Green))),
+                Line::from(Span::styled("处理完成", Style::default().fg(Color::Green))),
                 Line::raw(""),
                 Line::from(format!("输出文件：{}", output.display())),
                 Line::raw(""),
