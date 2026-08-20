@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::{config::Config, media::MediaProbe};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +60,10 @@ pub enum TaskEvent {
         completed: usize,
         total: usize,
         request: usize,
+    },
+    OverwriteRequested {
+        output: PathBuf,
+        response: UnboundedSender<bool>,
     },
     Writing,
     Finished(PathBuf),

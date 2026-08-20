@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -108,6 +109,12 @@ pub struct ResultState {
 }
 
 #[derive(Clone, Debug)]
+pub struct OverwritePrompt {
+    pub output: PathBuf,
+    response: UnboundedSender<bool>,
+}
+
+#[derive(Clone, Debug)]
 pub struct App {
     pub page: Page,
     pub config: Config,
@@ -127,6 +134,7 @@ pub struct App {
     pub processing: ProcessingState,
     pub result: ResultState,
     pub status_message: Option<String>,
+    pub overwrite_prompt: Option<OverwritePrompt>,
     cancellation: Option<CancellationToken>,
     result_scroll: u16,
 }
@@ -170,6 +178,7 @@ impl App {
             processing: ProcessingState::default(),
             result: ResultState::default(),
             status_message,
+            overwrite_prompt: None,
             cancellation: None,
             result_scroll: 0,
         }
@@ -203,6 +212,9 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Command> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.cancel_or_quit();
+        }
+        if self.overwrite_prompt.is_some() {
+            return self.handle_overwrite_key(key);
         }
         match self.page {
             Page::Home => self.handle_home_key(key),
@@ -352,6 +364,28 @@ impl App {
             KeyCode::Char('c') | KeyCode::Esc => self.cancel_or_quit(),
             _ => Vec::new(),
         }
+    }
+
+    fn handle_overwrite_key(&mut self, key: KeyEvent) -> Vec<Command> {
+        match key.code {
+            KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.answer_overwrite(true),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => self.answer_overwrite(false),
+            _ => Vec::new(),
+        }
+    }
+
+    fn answer_overwrite(&mut self, overwrite: bool) -> Vec<Command> {
+        let Some(prompt) = self.overwrite_prompt.take() else {
+            return Vec::new();
+        };
+        let output = prompt.output;
+        let _ = prompt.response.send(overwrite);
+        self.status_message = Some(if overwrite {
+            format!("将覆盖输出：{}", output.display())
+        } else {
+            format!("已跳过输出：{}", output.display())
+        });
+        Vec::new()
     }
 
     fn handle_result_key(&mut self, key: KeyEvent) -> Vec<Command> {
@@ -646,6 +680,7 @@ impl App {
 
     fn cancel_or_quit(&mut self) -> Vec<Command> {
         if let Some(cancellation) = self.cancellation.clone() {
+            self.overwrite_prompt = None;
             self.processing.stage = "正在取消…".into();
             vec![Command::Cancel(cancellation)]
         } else {
@@ -761,8 +796,13 @@ impl App {
                 self.processing.total = Some(total);
                 self.processing.request = Some(request);
             }
+            TaskEvent::OverwriteRequested { output, response } => {
+                self.processing.stage = "等待覆盖确认…".into();
+                self.overwrite_prompt = Some(OverwritePrompt { output, response });
+            }
             TaskEvent::Writing => self.processing.stage = "正在写入字幕…".into(),
             TaskEvent::Finished(output) => {
+                self.overwrite_prompt = None;
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -773,6 +813,7 @@ impl App {
                 };
             }
             TaskEvent::BatchFinished(summary) => {
+                self.overwrite_prompt = None;
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -783,6 +824,7 @@ impl App {
                 };
             }
             TaskEvent::Failed(error) => {
+                self.overwrite_prompt = None;
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -793,6 +835,7 @@ impl App {
                 };
             }
             TaskEvent::Cancelled => {
+                self.overwrite_prompt = None;
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -898,6 +941,8 @@ impl App {
 mod tests {
     use std::collections::HashMap;
 
+    use tokio::sync::mpsc::unbounded_channel;
+
     use super::*;
 
     #[test]
@@ -945,6 +990,30 @@ mod tests {
             panic!("expected a start command");
         };
         assert_eq!(job.output_mode, SubtitleOutputMode::Original);
+    }
+
+    #[test]
+    fn overwrite_prompt_sends_the_selected_decision() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        let (response, mut responses) = unbounded_channel();
+        let output = PathBuf::from("movie.zh-CN.srt");
+        app.update(Action::Task(Box::new(TaskEvent::OverwriteRequested {
+            output: output.clone(),
+            response,
+        })));
+
+        assert_eq!(
+            app.overwrite_prompt.as_ref().map(|prompt| &prompt.output),
+            Some(&output)
+        );
+        app.update(Action::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(responses.try_recv(), Ok(true));
+        assert!(app.overwrite_prompt.is_none());
     }
 
     #[test]

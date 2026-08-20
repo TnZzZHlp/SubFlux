@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
-    widgets::{Block, Borders, Clear, Paragraph},
+    layout::{Constraint, Layout, Rect},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -35,6 +35,30 @@ pub fn render(frame: &mut Frame, app: &App) {
         Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
         areas[1],
     );
+    if let Some(prompt) = &app.overwrite_prompt {
+        let area = centered_rect(frame.area(), 7, 80);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "输出文件已存在：\n{}\n\nY/Enter：覆盖    N/Esc：跳过",
+                prompt.output.display()
+            ))
+            .block(Block::default().title(" 覆盖确认 ").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+}
+
+fn centered_rect(area: Rect, height: u16, max_width: u16) -> Rect {
+    let width = area.width.saturating_sub(4).min(max_width);
+    let height = area.height.min(height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn truncate_footer(footer: String, max_width: usize) -> String {

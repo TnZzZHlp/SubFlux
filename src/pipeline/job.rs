@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -72,9 +72,15 @@ pub async fn run_pipeline(
         &job.target_language,
         document.format,
     )?;
-    if output.exists() && !job.config.output_overwrite {
-        return Err(AppError::OutputExists(output));
-    }
+    let overwrite = if output.exists() && !job.config.output_overwrite {
+        if confirm_overwrite(&output, &events, &cancellation).await? {
+            true
+        } else {
+            return Err(AppError::OutputExists(output));
+        }
+    } else {
+        job.config.output_overwrite
+    };
     if job.output_mode.needs_translation() {
         let translator = services
             .translator
@@ -100,15 +106,31 @@ pub async fn run_pipeline(
     send(&events, TaskEvent::Writing);
     let output = services
         .subtitle_writer
-        .write(
-            &document,
-            &output,
-            job.output_mode,
-            job.config.output_overwrite,
-        )
+        .write(&document, &output, job.output_mode, overwrite)
         .await?;
     debug!(output = %output.display(), "subtitle output pipeline completed");
     Ok(output)
+}
+
+async fn confirm_overwrite(
+    output: &std::path::Path,
+    events: &UnboundedSender<TaskEvent>,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    let (response, mut responses) = unbounded_channel();
+    if events
+        .send(TaskEvent::OverwriteRequested {
+            output: output.to_path_buf(),
+            response,
+        })
+        .is_err()
+    {
+        return Err(AppError::OutputExists(output.to_path_buf()));
+    }
+    tokio::select! {
+        decision = responses.recv() => decision.ok_or(AppError::Cancelled),
+        () = cancellation.cancelled() => Err(AppError::Cancelled),
+    }
 }
 
 async fn load_document(
@@ -395,6 +417,57 @@ mod tests {
             emitted
                 .iter()
                 .all(|event| !matches!(event, TaskEvent::TranslationStarted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_output_waits_for_overwrite_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("movie.ja.srt");
+        let output = directory.path().join("movie.zh-CN.srt");
+        let source_content = "1\n00:00:01,000 --> 00:00:02,000\nhello\n";
+        tokio::fs::write(&source, source_content).await.unwrap();
+        tokio::fs::write(&output, "old output").await.unwrap();
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let services = Arc::new(Services {
+            translator: None,
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, mut received_events) = unbounded_channel();
+        let task = tokio::spawn(run_pipeline(
+            PipelineJob {
+                video: None,
+                input: SubtitleInput::External(source),
+                source_language: LanguageCode::parse("en").unwrap(),
+                target_language: LanguageCode::parse("zh-CN").unwrap(),
+                output_mode: SubtitleOutputMode::Original,
+                config,
+            },
+            services,
+            CancellationToken::new(),
+            events,
+        ));
+
+        assert!(matches!(
+            received_events.recv().await,
+            Some(TaskEvent::ExtractingSubtitle)
+        ));
+        let TaskEvent::OverwriteRequested {
+            output: requested,
+            response,
+        } = received_events.recv().await.unwrap()
+        else {
+            panic!("expected overwrite prompt");
+        };
+        assert_eq!(requested, output);
+        response.send(true).unwrap();
+
+        assert_eq!(task.await.unwrap().unwrap(), output);
+        assert_eq!(
+            tokio::fs::read_to_string(output).await.unwrap(),
+            source_content
         );
     }
 

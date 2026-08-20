@@ -215,9 +215,11 @@ the same existing `<name>.<target-language>.<extension>` output name, so select
 the desired type before starting the task.
 
 STT produces SRT by default. A standalone subtitle such as `movie.ja.ass`
-becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs are
-protected unless `OUTPUT_OVERWRITE=true` is set; a batch records an existing
-output as a failed video and continues with the remaining videos.
+becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs prompt for
+confirmation; `Y`/`Enter` overwrites and `N`/`Esc` skips. Set
+`OUTPUT_OVERWRITE=true` to overwrite without prompting. In a batch,
+the prompt appears separately for each existing output and skipping continues
+with the remaining videos.
 
 ## Known limits in the first version
 
