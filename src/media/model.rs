@@ -41,6 +41,12 @@ impl SubtitleTrack {
         matches!(self.kind, SubtitleTrackKind::Text(_))
     }
 
+    fn is_sdh(&self) -> bool {
+        self.title
+            .as_deref()
+            .is_some_and(|title| title.to_ascii_lowercase().contains("sdh"))
+    }
+
     pub fn display_label(&self) -> String {
         let language = self.language.as_deref().unwrap_or("未知");
         let title = self.title.as_deref().filter(|title| !title.is_empty());
@@ -68,13 +74,14 @@ pub struct MediaProbe {
 }
 
 impl MediaProbe {
-    /// Auto selection is deliberately limited to textual tracks. Image tracks
-    /// are surfaced to the UI but never fed into the text subtitle pipeline.
+    /// Auto selection is deliberately limited to textual tracks. SDH tracks
+    /// take priority, followed by the container default. Image tracks are
+    /// surfaced to the UI but never fed into the text subtitle pipeline.
     pub fn auto_track(&self) -> Option<&SubtitleTrack> {
         self.subtitle_tracks
             .iter()
-            .find(|track| track.is_text() && track.default)
-            .or_else(|| self.subtitle_tracks.iter().find(|track| track.is_text()))
+            .filter(|track| track.is_text())
+            .min_by_key(|track| (!track.is_sdh(), !track.default))
     }
 
     pub fn track(&self, index: TrackIndex) -> Option<&SubtitleTrack> {
@@ -134,5 +141,33 @@ mod tests {
             ],
         };
         assert_eq!(probe.auto_track().unwrap().index, TrackIndex(3));
+    }
+
+    #[test]
+    fn auto_prefers_sdh_before_default_text_subtitles() {
+        let probe = MediaProbe {
+            subtitle_tracks: vec![
+                SubtitleTrack {
+                    index: TrackIndex(1),
+                    codec: "subrip".into(),
+                    language: Some("en".into()),
+                    title: Some("English".into()),
+                    default: true,
+                    forced: false,
+                    kind: SubtitleTrackKind::Text(SubtitleFormat::Srt),
+                },
+                SubtitleTrack {
+                    index: TrackIndex(2),
+                    codec: "subrip".into(),
+                    language: Some("en".into()),
+                    title: Some("English SDH".into()),
+                    default: false,
+                    forced: false,
+                    kind: SubtitleTrackKind::Text(SubtitleFormat::Srt),
+                },
+            ],
+        };
+
+        assert_eq!(probe.auto_track().unwrap().index, TrackIndex(2));
     }
 }

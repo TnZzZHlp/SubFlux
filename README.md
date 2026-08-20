@@ -16,8 +16,8 @@ Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
 - An optional startup path: a video path is prefilled directly, while a
   directory is scanned recursively for supported videos. The selection page
   can start a sequential batch over every discovered video.
-- Auto selection of the default text subtitle track, falling back to STT when
-  no text track exists.
+- Auto selection prioritizes text subtitle tracks marked SDH, then the
+  default text track, falling back to STT when no text track exists.
 - Manual selection of an embedded track, an external `.srt`, `.ass`, `.ssa`,
   or `.vtt` file, or STT.
 - SRT, ASS/SSA, and WebVTT parsing that replaces only translatable text.
@@ -167,8 +167,9 @@ all discovered videos in that order; `Enter` still selects one video for the
 existing single-video workflow. You can return to Home to adjust languages or
 output type before pressing `B`.
 
-Batch processing supports **Auto** (each video chooses its own default text
-track and falls back to STT) and explicit **STT**. A selected embedded-track
+Batch processing supports **Auto** (each video chooses its own SDH-preferred
+text track, then its default text track, and falls back to STT) and explicit
+**STT**. A selected embedded-track
 index or one external subtitle path cannot safely apply to unrelated videos,
 so those modes are rejected for a batch. Each video is independent: a failure
 or an existing output is recorded and the next video continues. `C` or `Esc`
