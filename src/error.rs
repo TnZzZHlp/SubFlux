@@ -50,6 +50,8 @@ pub enum AppError {
     TranslationError(String),
     #[error("output already exists: {}", .0.display())]
     OutputExists(PathBuf),
+    #[error("output skipped: {}", .0.display())]
+    Skipped(PathBuf),
     #[error("operation cancelled")]
     Cancelled,
     #[error("invalid configuration: {0}")]

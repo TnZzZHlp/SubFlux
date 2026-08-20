@@ -22,7 +22,7 @@ pub fn build_stt_provider(config: &Config) -> Result<DynSttProvider> {
             .eq_ignore_ascii_case("openai-compatible")
     {
         return Err(AppError::InvalidConfig(format!(
-            "STT_PROVIDER={} is not supported; use openai-compatible",
+            "SUBFLUX_STT_PROVIDER={} is not supported; use openai-compatible",
             config.stt.provider
         )));
     }

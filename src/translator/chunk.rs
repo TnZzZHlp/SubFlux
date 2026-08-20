@@ -32,7 +32,7 @@ impl TranslationChunkConfig {
     fn validate(self) -> Result<()> {
         if self.chunk_size == 0 {
             return Err(AppError::InvalidConfig(
-                "TRANSLATOR_CHUNK_SIZE must be greater than zero".into(),
+                "SUBFLUX_TRANSLATOR_CHUNK_SIZE must be greater than zero".into(),
             ));
         }
         Ok(())

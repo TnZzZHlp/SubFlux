@@ -14,6 +14,7 @@ pub struct BatchFailure {
 pub struct BatchSummary {
     pub total: usize,
     pub succeeded: Vec<PathBuf>,
+    pub skipped: Vec<PathBuf>,
     pub failed: Vec<BatchFailure>,
 }
 
@@ -29,11 +30,23 @@ pub enum TaskEvent {
         total: usize,
         video: PathBuf,
     },
+    /// A pipeline event associated with one video in a concurrent batch.
+    BatchVideoEvent {
+        current: usize,
+        total: usize,
+        video: PathBuf,
+        event: Box<TaskEvent>,
+    },
     BatchVideoSucceeded {
         current: usize,
         total: usize,
         video: PathBuf,
         output: PathBuf,
+    },
+    BatchVideoSkipped {
+        current: usize,
+        total: usize,
+        video: PathBuf,
     },
     BatchVideoFailed {
         current: usize,
@@ -62,6 +75,11 @@ pub enum TaskEvent {
         request: usize,
     },
     OverwriteRequested {
+        output: PathBuf,
+        response: UnboundedSender<bool>,
+    },
+    /// One shared overwrite decision for all existing outputs in a batch.
+    BatchOverwriteRequested {
         output: PathBuf,
         response: UnboundedSender<bool>,
     },

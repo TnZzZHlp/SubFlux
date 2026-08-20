@@ -206,7 +206,8 @@ fn execute(command: Command, events: tokio::sync::mpsc::UnboundedSender<TaskEven
 
 fn init_logging() {
     let path = PathBuf::from("subtitle-translator.log");
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_env("SUBFLUX_RUST_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     // A fresh file handle per event avoids terminal stderr output and keeps the
     // TUI intact. Paths and command names are logged, never authorization data.
     let _ = tracing_subscriber::fmt()

@@ -40,7 +40,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             config.stt.api_key.masked()
         )),
         Line::from(format!("HTTP 超时：{} 秒", config.http_timeout.as_secs())),
-        Line::from(format!("允许覆盖输出：{}", config.output_overwrite)),
+        Line::from(format!("批量视频并行数：{}", config.batch_concurrency)),
         Line::raw(""),
         Line::from("R：重新加载 .env  Esc/H：返回首页  Q：退出"),
     ];

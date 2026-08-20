@@ -36,15 +36,23 @@ pub fn render(frame: &mut Frame, app: &App) {
         areas[1],
     );
     if let Some(prompt) = &app.overwrite_prompt {
-        let area = centered_rect(frame.area(), 7, 80);
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(format!(
+        let area = centered_rect(frame.area(), if prompt.batch { 8 } else { 7 }, 80);
+        let message = if prompt.batch {
+            format!(
+                "批量任务发现已有输出：\n{}\n\nY/Enter：覆盖本批量任务中所有已有输出\nN/Esc：跳过本批量任务中所有已有输出",
+                prompt.output.display()
+            )
+        } else {
+            format!(
                 "输出文件已存在：\n{}\n\nY/Enter：覆盖    N/Esc：跳过",
                 prompt.output.display()
-            ))
-            .block(Block::default().title(" 覆盖确认 ").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
+            )
+        };
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(message)
+                .block(Block::default().title(" 覆盖确认 ").borders(Borders::ALL))
+                .wrap(Wrap { trim: false }),
             area,
         );
     }

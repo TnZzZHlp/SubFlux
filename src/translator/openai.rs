@@ -16,6 +16,7 @@ use super::{
     TranslationRequest, TranslationResponse,
     prompt::{system_prompt, user_payload},
     provider::Translator,
+    sse::{SseEvent, read_response},
 };
 
 #[derive(Clone)]
@@ -29,10 +30,10 @@ pub struct OpenAiCompatibleTranslator {
 impl OpenAiCompatibleTranslator {
     pub fn new(config: &TranslatorConfig, timeout: Duration) -> Result<Self> {
         if !config.api_key.is_configured() {
-            return Err(AppError::MissingConfiguration("TRANSLATOR_API_KEY"));
+            return Err(AppError::MissingConfiguration("SUBFLUX_TRANSLATOR_API_KEY"));
         }
         if config.model.trim().is_empty() {
-            return Err(AppError::MissingConfiguration("TRANSLATOR_MODEL"));
+            return Err(AppError::MissingConfiguration("SUBFLUX_TRANSLATOR_MODEL"));
         }
         Ok(Self {
             client: Client::builder()
@@ -56,6 +57,7 @@ impl Translator for OpenAiCompatibleTranslator {
         let payload = OpenAiRequest {
             model: &self.model,
             temperature: 0.2,
+            stream: true,
             messages: vec![
                 Message {
                     role: "system",
@@ -80,27 +82,18 @@ impl Translator for OpenAiCompatibleTranslator {
             () = cancellation.cancelled() => return Err(AppError::Cancelled),
         };
         let status = response.status();
-        let bytes = response.bytes().await.map_err(AppError::Http)?;
+        if !status.is_success() {
+            let bytes = response.bytes().await.map_err(AppError::Http)?;
+            return Err(api_error(status.as_u16(), &bytes, &self.api_key));
+        }
+        let events = read_response(response, cancellation).await?;
+        let content = stream_content(&events)?;
         debug!(
             model = %self.model,
             segments = request.segments.len(),
             elapsed_ms = started.elapsed().as_millis(),
-            "OpenAI-compatible translation response received"
+            "OpenAI-compatible streaming translation response received"
         );
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &bytes, &self.api_key));
-        }
-        let response: OpenAiResponse = serde_json::from_slice(&bytes).map_err(|error| {
-            AppError::InvalidApiResponse(format!("invalid chat completion JSON: {error}"))
-        })?;
-        let content = response
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| content_to_text(choice.message.content))
-            .ok_or_else(|| {
-                AppError::InvalidApiResponse("chat completion had no text content".into())
-            })?;
         let translated = parse_translation_json(&content)?;
         translated.validate_for(&request)?;
         Ok(translated)
@@ -111,6 +104,7 @@ impl Translator for OpenAiCompatibleTranslator {
 struct OpenAiRequest<'a> {
     model: &'a str,
     temperature: f32,
+    stream: bool,
     messages: Vec<Message>,
 }
 
@@ -121,35 +115,45 @@ struct Message {
 }
 
 #[derive(Deserialize)]
-struct OpenAiResponse {
-    choices: Vec<Choice>,
+struct OpenAiStreamResponse {
+    choices: Vec<OpenAiStreamChoice>,
 }
 
 #[derive(Deserialize)]
-struct Choice {
-    message: ResponseMessage,
+struct OpenAiStreamChoice {
+    delta: OpenAiDelta,
 }
 
 #[derive(Deserialize)]
-struct ResponseMessage {
-    content: Value,
+struct OpenAiDelta {
+    content: Option<String>,
 }
 
-fn content_to_text(value: Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value),
-        Value::Array(parts) => {
-            let text: String = parts
-                .into_iter()
-                .filter_map(|part| {
-                    part.get("text")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                })
-                .collect();
-            (!text.is_empty()).then_some(text)
+fn stream_content(events: &[SseEvent]) -> Result<String> {
+    let mut content = String::new();
+    for event in events {
+        if event.data.trim() == "[DONE]" {
+            break;
         }
-        _ => None,
+        let response: OpenAiStreamResponse =
+            serde_json::from_str(&event.data).map_err(|error| {
+                AppError::InvalidApiResponse(format!("invalid chat completion SSE JSON: {error}"))
+            })?;
+        if let Some(text) = response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.delta.content)
+        {
+            content.push_str(&text);
+        }
+    }
+    if content.is_empty() {
+        Err(AppError::InvalidApiResponse(
+            "chat completion stream had no text content".into(),
+        ))
+    } else {
+        Ok(content)
     }
 }
 
@@ -208,6 +212,26 @@ fn api_error(status: u16, bytes: &[u8], api_key: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joins_openai_sse_text_deltas() {
+        let content = stream_content(&[
+            SseEvent {
+                event: None,
+                data: r#"{"choices":[{"delta":{"content":"["}}]}"#.into(),
+            },
+            SseEvent {
+                event: None,
+                data: r#"{"choices":[{"delta":{"content":"{}"}}]}"#.into(),
+            },
+            SseEvent {
+                event: None,
+                data: "[DONE]".into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(content, "[{}");
+    }
 
     #[test]
     fn reads_object_or_array_translation_json() {

@@ -4,6 +4,7 @@ pub mod model;
 pub mod openai;
 pub(crate) mod prompt;
 pub mod provider;
+mod sse;
 
 use std::sync::Arc;
 

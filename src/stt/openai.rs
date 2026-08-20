@@ -29,10 +29,10 @@ pub struct OpenAiCompatibleStt {
 impl OpenAiCompatibleStt {
     pub fn new(config: &SttConfig, timeout: Duration) -> Result<Self> {
         if !config.api_key.is_configured() {
-            return Err(AppError::MissingConfiguration("STT_API_KEY"));
+            return Err(AppError::MissingConfiguration("SUBFLUX_STT_API_KEY"));
         }
         if config.model.trim().is_empty() {
-            return Err(AppError::MissingConfiguration("STT_MODEL"));
+            return Err(AppError::MissingConfiguration("SUBFLUX_STT_MODEL"));
         }
         Ok(Self {
             client: Client::builder()

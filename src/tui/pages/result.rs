@@ -56,11 +56,14 @@ fn render_single_result(app: &App) -> Vec<Line<'static>> {
 
 fn render_batch_result(summary: &BatchSummary) -> Vec<Line<'static>> {
     let has_failures = !summary.failed.is_empty();
+    let has_skipped = !summary.skipped.is_empty();
     let heading = if has_failures {
         Span::styled(
             "批量处理已结束（有失败）",
             Style::default().fg(Color::Yellow),
         )
+    } else if has_skipped {
+        Span::styled("批量处理完成（有跳过）", Style::default().fg(Color::Yellow))
     } else {
         Span::styled("批量处理完成", Style::default().fg(Color::Green))
     };
@@ -68,12 +71,23 @@ fn render_batch_result(summary: &BatchSummary) -> Vec<Line<'static>> {
         Line::from(heading),
         Line::raw(""),
         Line::from(format!(
-            "总计：{}  成功：{}  失败：{}",
+            "总计：{}  成功：{}  跳过：{}  失败：{}",
             summary.total,
             summary.succeeded.len(),
+            summary.skipped.len(),
             summary.failed.len()
         )),
     ];
+    if has_skipped {
+        lines.push(Line::raw(""));
+        lines.push(Line::from("跳过的文件："));
+        lines.extend(
+            summary
+                .skipped
+                .iter()
+                .map(|video| Line::from(format!("• {}", video.display()))),
+        );
+    }
     if has_failures {
         lines.push(Line::raw(""));
         lines.push(Line::from("失败详情："));
@@ -86,12 +100,14 @@ fn render_batch_result(summary: &BatchSummary) -> Vec<Line<'static>> {
                     .map(|line| Line::from(format!("  {line}"))),
             );
         }
-        lines.extend([
-            Line::raw(""),
-            Line::from("↑/↓、PageUp/PageDown：滚动详情  Enter/Esc：返回首页  Q：退出"),
-        ]);
-    } else {
-        lines.extend([Line::raw(""), Line::from("Enter/Esc：返回首页  Q：退出")]);
     }
+    lines.extend([
+        Line::raw(""),
+        Line::from(if has_failures || has_skipped {
+            "↑/↓、PageUp/PageDown：滚动详情  Enter/Esc：返回首页  Q：退出"
+        } else {
+            "Enter/Esc：返回首页  Q：退出"
+        }),
+    ]);
     lines
 }

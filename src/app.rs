@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
@@ -92,13 +92,34 @@ impl Default for ProcessingState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BatchFileProgress {
+    pub video: PathBuf,
+    pub stage: String,
+    pub completed: usize,
+    pub total: Option<usize>,
+    pub request: Option<usize>,
+}
+
+impl BatchFileProgress {
+    fn new(video: PathBuf) -> Self {
+        Self {
+            video,
+            stage: "准备中…".into(),
+            completed: 0,
+            total: None,
+            request: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct BatchProcessingState {
-    pub current: usize,
     pub total: usize,
-    pub current_video: Option<PathBuf>,
     pub succeeded: usize,
+    pub skipped: usize,
     pub failed: usize,
+    pub active: BTreeMap<usize, BatchFileProgress>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,6 +132,7 @@ pub struct ResultState {
 #[derive(Clone, Debug)]
 pub struct OverwritePrompt {
     pub output: PathBuf,
+    pub batch: bool,
     response: UnboundedSender<bool>,
 }
 
@@ -136,6 +158,7 @@ pub struct App {
     pub status_message: Option<String>,
     pub overwrite_prompt: Option<OverwritePrompt>,
     cancellation: Option<CancellationToken>,
+    processing_scroll: u16,
     result_scroll: u16,
 }
 
@@ -180,6 +203,7 @@ impl App {
             status_message,
             overwrite_prompt: None,
             cancellation: None,
+            processing_scroll: 0,
             result_scroll: 0,
         }
     }
@@ -193,7 +217,7 @@ impl App {
     }
 
     /// Stores recursively discovered videos for either individual selection or
-    /// an explicit sequential batch run.
+    /// an explicit batch run.
     pub fn set_video_candidates(&mut self, videos: Vec<PathBuf>) {
         self.video_candidates = videos;
         self.video_cursor = 0;
@@ -203,7 +227,7 @@ impl App {
             count => {
                 self.page = Page::Videos;
                 self.status_message = Some(format!(
-                    "已找到 {count} 个视频：按 B 连续处理全部，或按 Enter 选择单个视频。"
+                    "已找到 {count} 个视频：按 B 批量处理全部，或按 Enter 选择单个视频。"
                 ));
             }
         }
@@ -362,6 +386,22 @@ impl App {
     fn handle_processing_key(&mut self, key: KeyEvent) -> Vec<Command> {
         match key.code {
             KeyCode::Char('c') | KeyCode::Esc => self.cancel_or_quit(),
+            KeyCode::Up if self.processing.batch.is_some() => {
+                self.processing_scroll = self.processing_scroll.saturating_sub(1);
+                Vec::new()
+            }
+            KeyCode::Down if self.processing.batch.is_some() => {
+                self.processing_scroll = self.processing_scroll.saturating_add(1);
+                Vec::new()
+            }
+            KeyCode::PageUp if self.processing.batch.is_some() => {
+                self.processing_scroll = self.processing_scroll.saturating_sub(10);
+                Vec::new()
+            }
+            KeyCode::PageDown if self.processing.batch.is_some() => {
+                self.processing_scroll = self.processing_scroll.saturating_add(10);
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -379,11 +419,13 @@ impl App {
             return Vec::new();
         };
         let output = prompt.output;
+        let batch = prompt.batch;
         let _ = prompt.response.send(overwrite);
-        self.status_message = Some(if overwrite {
-            format!("将覆盖输出：{}", output.display())
-        } else {
-            format!("已跳过输出：{}", output.display())
+        self.status_message = Some(match (batch, overwrite) {
+            (true, true) => "将覆盖本批量任务中所有已有输出。".into(),
+            (true, false) => "将跳过本批量任务中所有已有输出。".into(),
+            (false, true) => format!("将覆盖输出：{}", output.display()),
+            (false, false) => format!("已跳过输出：{}", output.display()),
         });
         Vec::new()
     }
@@ -609,6 +651,7 @@ impl App {
             config: self.config.clone(),
         };
         self.processing = ProcessingState::default();
+        self.processing_scroll = 0;
         self.result = ResultState::default();
         self.result_scroll = 0;
         self.cancellation = Some(cancellation.clone());
@@ -667,9 +710,10 @@ impl App {
             config: self.config.clone(),
         };
         self.processing = ProcessingState::default();
+        self.processing_scroll = 0;
         self.result = ResultState::default();
         self.result_scroll = 0;
-        self.status_message = Some(format!("正在按发现顺序批量处理 {total} 个视频…"));
+        self.status_message = Some(format!("正在批量处理 {total} 个视频…"));
         self.cancellation = Some(cancellation.clone());
         self.page = Page::Processing;
         vec![Command::StartBatch {
@@ -680,7 +724,7 @@ impl App {
 
     fn cancel_or_quit(&mut self) -> Vec<Command> {
         if let Some(cancellation) = self.cancellation.clone() {
-            self.overwrite_prompt = None;
+            self.clear_overwrite_prompts();
             self.processing.stage = "正在取消…".into();
             vec![Command::Cancel(cancellation)]
         } else {
@@ -688,9 +732,129 @@ impl App {
         }
     }
 
+    fn clear_overwrite_prompts(&mut self) {
+        self.overwrite_prompt = None;
+    }
+
+    fn batch_state(&mut self, total: usize) -> &mut BatchProcessingState {
+        let batch = self
+            .processing
+            .batch
+            .get_or_insert_with(|| BatchProcessingState {
+                total,
+                ..BatchProcessingState::default()
+            });
+        batch.total = total;
+        batch
+    }
+
+    fn batch_file(
+        &mut self,
+        current: usize,
+        total: usize,
+        video: &std::path::Path,
+    ) -> &mut BatchFileProgress {
+        self.batch_state(total)
+            .active
+            .entry(current)
+            .or_insert_with(|| BatchFileProgress::new(video.to_path_buf()))
+    }
+
+    fn handle_batch_video_event(
+        &mut self,
+        current: usize,
+        total: usize,
+        video: PathBuf,
+        event: TaskEvent,
+    ) {
+        match event {
+            TaskEvent::Probing => {
+                self.batch_file(current, total, &video).stage = "正在探测媒体…".into();
+            }
+            TaskEvent::TracksLoaded(_) => {
+                self.batch_file(current, total, &video).stage = "字幕轨已加载…".into();
+            }
+            TaskEvent::ExtractingSubtitle => {
+                self.batch_file(current, total, &video).stage = "正在提取字幕…".into();
+            }
+            TaskEvent::ExtractingAudio => {
+                self.batch_file(current, total, &video).stage = "正在提取音频…".into();
+            }
+            TaskEvent::SttStarted {
+                current: completed,
+                total: file_total,
+            } => {
+                let file = self.batch_file(current, total, &video);
+                file.stage = "正在进行语音识别…".into();
+                file.completed = completed;
+                file.total = Some(file_total);
+                file.request = None;
+            }
+            TaskEvent::SttProgress {
+                current: completed,
+                total: file_total,
+            } => {
+                let file = self.batch_file(current, total, &video);
+                file.stage = "正在进行语音识别…".into();
+                file.completed = completed;
+                file.total = file_total;
+            }
+            TaskEvent::TranslationStarted { total: file_total } => {
+                let file = self.batch_file(current, total, &video);
+                file.stage = "正在翻译…".into();
+                file.completed = 0;
+                file.total = Some(file_total);
+                file.request = None;
+            }
+            TaskEvent::TranslationProgress {
+                completed,
+                total: file_total,
+                request,
+            } => {
+                let file = self.batch_file(current, total, &video);
+                file.stage = "正在翻译…".into();
+                file.completed = completed;
+                file.total = Some(file_total);
+                file.request = Some(request);
+            }
+            TaskEvent::OverwriteRequested { output, response } => {
+                self.batch_file(current, total, &video).stage = "等待覆盖确认…".into();
+                self.overwrite_prompt = Some(OverwritePrompt {
+                    output,
+                    batch: false,
+                    response,
+                });
+            }
+            TaskEvent::BatchOverwriteRequested { output, response } => {
+                self.batch_file(current, total, &video).stage = "等待批量覆盖确认…".into();
+                self.overwrite_prompt = Some(OverwritePrompt {
+                    output,
+                    batch: true,
+                    response,
+                });
+            }
+            TaskEvent::Writing => {
+                self.batch_file(current, total, &video).stage = "正在写入字幕…".into();
+            }
+            TaskEvent::BatchStarted { .. }
+            | TaskEvent::BatchVideoStarted { .. }
+            | TaskEvent::BatchVideoEvent { .. }
+            | TaskEvent::BatchVideoSucceeded { .. }
+            | TaskEvent::BatchVideoSkipped { .. }
+            | TaskEvent::BatchVideoFailed { .. }
+            | TaskEvent::Finished(_)
+            | TaskEvent::BatchFinished(_)
+            | TaskEvent::Failed(_)
+            | TaskEvent::Cancelled
+            | TaskEvent::ConfigReloaded(_)
+            | TaskEvent::ConfigReloadFailed(_) => {}
+        }
+    }
+
     fn handle_task(&mut self, event: TaskEvent) -> Vec<Command> {
         match event {
             TaskEvent::BatchStarted { total } => {
+                self.processing_scroll = 0;
                 self.processing.batch = Some(BatchProcessingState {
                     total,
                     ..BatchProcessingState::default()
@@ -702,55 +866,43 @@ impl App {
                 total,
                 video,
             } => {
-                let batch = self
-                    .processing
-                    .batch
-                    .get_or_insert_with(|| BatchProcessingState {
-                        total,
-                        ..BatchProcessingState::default()
-                    });
-                batch.current = current;
-                batch.total = total;
-                batch.current_video = Some(video);
-                self.processing.stage = format!("正在处理第 {current}/{total} 个视频…");
-                self.processing.completed = 0;
-                self.processing.total = None;
-                self.processing.request = None;
+                self.batch_state(total)
+                    .active
+                    .insert(current, BatchFileProgress::new(video));
             }
-            TaskEvent::BatchVideoSucceeded {
+            TaskEvent::BatchVideoEvent {
                 current,
                 total,
                 video,
+                event,
+            } => self.handle_batch_video_event(current, total, video, *event),
+            TaskEvent::BatchVideoSucceeded {
+                current,
+                total,
+                video: _,
                 output: _,
             } => {
-                let batch = self
-                    .processing
-                    .batch
-                    .get_or_insert_with(|| BatchProcessingState {
-                        total,
-                        ..BatchProcessingState::default()
-                    });
-                batch.current = current;
-                batch.total = total;
-                batch.current_video = Some(video);
+                let batch = self.batch_state(total);
+                batch.active.remove(&current);
                 batch.succeeded += 1;
+            }
+            TaskEvent::BatchVideoSkipped {
+                current,
+                total,
+                video: _,
+            } => {
+                let batch = self.batch_state(total);
+                batch.active.remove(&current);
+                batch.skipped += 1;
             }
             TaskEvent::BatchVideoFailed {
                 current,
                 total,
-                video,
+                video: _,
                 error,
             } => {
-                let batch = self
-                    .processing
-                    .batch
-                    .get_or_insert_with(|| BatchProcessingState {
-                        total,
-                        ..BatchProcessingState::default()
-                    });
-                batch.current = current;
-                batch.total = total;
-                batch.current_video = Some(video);
+                let batch = self.batch_state(total);
+                batch.active.remove(&current);
                 batch.failed += 1;
                 self.processing.errors += 1;
                 self.status_message = Some(format!("第 {current}/{total} 个视频处理失败：{error}"));
@@ -798,11 +950,23 @@ impl App {
             }
             TaskEvent::OverwriteRequested { output, response } => {
                 self.processing.stage = "等待覆盖确认…".into();
-                self.overwrite_prompt = Some(OverwritePrompt { output, response });
+                self.overwrite_prompt = Some(OverwritePrompt {
+                    output,
+                    batch: false,
+                    response,
+                });
+            }
+            TaskEvent::BatchOverwriteRequested { output, response } => {
+                self.processing.stage = "等待批量覆盖确认…".into();
+                self.overwrite_prompt = Some(OverwritePrompt {
+                    output,
+                    batch: true,
+                    response,
+                });
             }
             TaskEvent::Writing => self.processing.stage = "正在写入字幕…".into(),
             TaskEvent::Finished(output) => {
-                self.overwrite_prompt = None;
+                self.clear_overwrite_prompts();
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -813,7 +977,7 @@ impl App {
                 };
             }
             TaskEvent::BatchFinished(summary) => {
-                self.overwrite_prompt = None;
+                self.clear_overwrite_prompts();
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -824,7 +988,7 @@ impl App {
                 };
             }
             TaskEvent::Failed(error) => {
-                self.overwrite_prompt = None;
+                self.clear_overwrite_prompts();
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -835,7 +999,7 @@ impl App {
                 };
             }
             TaskEvent::Cancelled => {
-                self.overwrite_prompt = None;
+                self.clear_overwrite_prompts();
                 self.cancellation = None;
                 self.page = Page::Result;
                 self.result_scroll = 0;
@@ -923,6 +1087,10 @@ impl App {
         )
     }
 
+    pub const fn processing_scroll(&self) -> u16 {
+        self.processing_scroll
+    }
+
     pub const fn result_scroll(&self) -> u16 {
         self.result_scroll
     }
@@ -933,7 +1101,7 @@ impl App {
                 .result
                 .batch
                 .as_ref()
-                .is_some_and(|summary| !summary.failed.is_empty())
+                .is_some_and(|summary| !summary.failed.is_empty() || !summary.skipped.is_empty())
     }
 }
 
@@ -1007,6 +1175,11 @@ mod tests {
             app.overwrite_prompt.as_ref().map(|prompt| &prompt.output),
             Some(&output)
         );
+        assert!(
+            app.overwrite_prompt
+                .as_ref()
+                .is_some_and(|prompt| !prompt.batch)
+        );
         app.update(Action::Key(KeyEvent::new(
             KeyCode::Char('y'),
             KeyModifiers::NONE,
@@ -1014,6 +1187,34 @@ mod tests {
 
         assert_eq!(responses.try_recv(), Ok(true));
         assert!(app.overwrite_prompt.is_none());
+    }
+
+    #[test]
+    fn batch_overwrite_prompt_applies_to_all_existing_outputs() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        let (response, mut responses) = unbounded_channel();
+        app.update(Action::Task(Box::new(TaskEvent::BatchOverwriteRequested {
+            output: PathBuf::from("movie.zh-CN.srt"),
+            response,
+        })));
+
+        assert!(
+            app.overwrite_prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.batch)
+        );
+        app.update(Action::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        )));
+
+        assert_eq!(responses.try_recv(), Ok(false));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("本批量任务"))
+        );
     }
 
     #[test]
@@ -1113,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn discovered_videos_can_start_a_sequential_batch() {
+    fn discovered_videos_can_start_a_batch() {
         let config = Config::from_map(&HashMap::new()).unwrap();
         let mut app = App::new(config, ToolStatus::default());
         app.set_video_candidates(vec![
@@ -1162,6 +1363,72 @@ mod tests {
     }
 
     #[test]
+    fn batch_video_events_update_each_active_file_progress() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        app.page = Page::Processing;
+        let first = PathBuf::from("first.mkv");
+        let second = PathBuf::from("second.mkv");
+
+        app.update(Action::Task(Box::new(TaskEvent::BatchVideoEvent {
+            current: 1,
+            total: 3,
+            video: first.clone(),
+            event: Box::new(TaskEvent::TranslationProgress {
+                completed: 2,
+                total: 5,
+                request: 1,
+            }),
+        })));
+        app.update(Action::Task(Box::new(TaskEvent::BatchVideoEvent {
+            current: 2,
+            total: 3,
+            video: second.clone(),
+            event: Box::new(TaskEvent::TranslationProgress {
+                completed: 4,
+                total: 10,
+                request: 1,
+            }),
+        })));
+
+        let batch = app.processing.batch.as_ref().unwrap();
+        assert_eq!(batch.total, 3);
+        assert_eq!(batch.active.len(), 2);
+        assert_eq!(batch.active[&1].video, first);
+        assert_eq!(batch.active[&1].completed, 2);
+        assert_eq!(batch.active[&1].total, Some(5));
+        assert_eq!(batch.active[&2].video, second);
+        assert_eq!(batch.active[&2].completed, 4);
+        assert_eq!(batch.active[&2].total, Some(10));
+
+        app.update(Action::Task(Box::new(TaskEvent::BatchVideoSkipped {
+            current: 1,
+            total: 3,
+            video: first,
+        })));
+        let batch = app.processing.batch.as_ref().unwrap();
+        assert_eq!(batch.active.len(), 1);
+        assert_eq!(batch.skipped, 1);
+    }
+
+    #[test]
+    fn processing_page_scrolls_active_batch_files() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        app.page = Page::Processing;
+        app.processing.batch = Some(BatchProcessingState::default());
+
+        let _ = app.update(Action::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.processing_scroll(), 10);
+
+        let _ = app.update(Action::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.processing_scroll(), 9);
+    }
+
+    #[test]
     fn batch_events_produce_a_summary_result() {
         let config = Config::from_map(&HashMap::new()).unwrap();
         let mut app = App::new(config, ToolStatus::default());
@@ -1177,6 +1444,7 @@ mod tests {
         let summary = BatchSummary {
             total: 2,
             succeeded: vec![PathBuf::from("first.zh-CN.srt")],
+            skipped: Vec::new(),
             failed: vec![crate::event::BatchFailure {
                 video: PathBuf::from("second.mkv"),
                 error: "fixture failure".into(),

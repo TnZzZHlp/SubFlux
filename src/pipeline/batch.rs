@@ -1,6 +1,9 @@
 use std::{future::Future, path::PathBuf, sync::Arc};
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::{
+    sync::{Semaphore, mpsc::UnboundedSender},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -12,7 +15,10 @@ use crate::{
     subtitle::SubtitleOutputMode,
 };
 
-use super::{PipelineJob, SubtitleInput, run_pipeline};
+use super::{
+    PipelineJob, SubtitleInput,
+    job::{BatchOverwrite, run_pipeline_with_batch_overwrite},
+};
 
 /// Subtitle sources that can be applied safely to every independently probed
 /// video in a batch.
@@ -50,29 +56,40 @@ impl BatchJob {
     }
 }
 
-/// Runs videos in discovery order. A per-video failure is recorded and the
-/// next video still starts; cancellation is the only condition that stops the
-/// sequence early.
+/// Runs independent videos with the configured concurrency. A per-video
+/// failure is recorded and does not stop other videos; cancellation stops new
+/// videos and cancels the running pipelines through the shared token.
 pub async fn run_batch(
     job: BatchJob,
     services: Arc<Services>,
     cancellation: CancellationToken,
     events: UnboundedSender<TaskEvent>,
 ) -> Result<BatchSummary> {
-    let summary = run_batch_jobs(&job, &cancellation, &events, |pipeline_job| {
-        run_pipeline(
-            pipeline_job,
-            Arc::clone(&services),
-            cancellation.clone(),
-            events.clone(),
-        )
-    })
+    let run_cancellation = cancellation.clone();
+    let run_services = Arc::clone(&services);
+    let batch_overwrite = BatchOverwrite::default();
+    let summary = run_batch_jobs(
+        &job,
+        &cancellation,
+        &events,
+        move |pipeline_job, pipeline_events| {
+            run_pipeline_with_batch_overwrite(
+                pipeline_job,
+                Arc::clone(&run_services),
+                run_cancellation.clone(),
+                pipeline_events,
+                batch_overwrite.clone(),
+            )
+        },
+    )
     .await?;
 
     debug!(
         total = summary.total,
         succeeded = summary.succeeded.len(),
+        skipped = summary.skipped.len(),
         failed = summary.failed.len(),
+        concurrency = job.config.batch_concurrency,
         "subtitle batch pipeline completed"
     );
     Ok(summary)
@@ -82,11 +99,11 @@ async fn run_batch_jobs<F, Fut>(
     job: &BatchJob,
     cancellation: &CancellationToken,
     events: &UnboundedSender<TaskEvent>,
-    mut run_one: F,
+    run_one: F,
 ) -> Result<BatchSummary>
 where
-    F: FnMut(PipelineJob) -> Fut,
-    Fut: Future<Output = Result<PathBuf>>,
+    F: Fn(PipelineJob, UnboundedSender<TaskEvent>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<PathBuf>> + Send + 'static,
 {
     if job.videos.is_empty() {
         return Err(AppError::InvalidConfig(
@@ -101,21 +118,76 @@ where
     };
     send(events, TaskEvent::BatchStarted { total });
 
-    for (index, video) in job.videos.iter().cloned().enumerate() {
-        check_cancelled(cancellation)?;
-        let current = index + 1;
-        send(
-            events,
-            TaskEvent::BatchVideoStarted {
-                current,
-                total,
-                video: video.clone(),
-            },
-        );
+    let semaphore = Arc::new(Semaphore::new(job.config.batch_concurrency.min(total)));
+    let run_one = Arc::new(run_one);
+    let mut tasks = JoinSet::new();
 
-        match run_one(job.pipeline_job(video.clone())).await {
+    for (index, video) in job.videos.iter().cloned().enumerate() {
+        let pipeline_job = job.pipeline_job(video.clone());
+        let semaphore = Arc::clone(&semaphore);
+        let run_one = Arc::clone(&run_one);
+        let cancellation = cancellation.clone();
+        let events = events.clone();
+        tasks.spawn(async move {
+            let permit = tokio::select! {
+                permit = semaphore.acquire_owned() => permit.expect("batch semaphore cannot be closed"),
+                () = cancellation.cancelled() => {
+                    return (index, video, Err(AppError::Cancelled));
+                }
+            };
+            if cancellation.is_cancelled() {
+                drop(permit);
+                return (index, video, Err(AppError::Cancelled));
+            }
+
+            let current = index + 1;
+            send(
+                &events,
+                TaskEvent::BatchVideoStarted {
+                    current,
+                    total,
+                    video: video.clone(),
+                },
+            );
+            let (pipeline_events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+            let forwarded_events = events.clone();
+            let event_video = video.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(event) = received_events.recv().await {
+                    send(
+                        &forwarded_events,
+                        TaskEvent::BatchVideoEvent {
+                            current,
+                            total,
+                            video: event_video.clone(),
+                            event: Box::new(event),
+                        },
+                    );
+                }
+            });
+            let result = run_one(pipeline_job, pipeline_events).await;
+            let result = match forwarder.await {
+                Ok(()) => result,
+                Err(error) => Err(AppError::TranslationError(format!(
+                    "batch event forwarder failed: {error}"
+                ))),
+            };
+            drop(permit);
+            (index, video, result)
+        });
+    }
+
+    let mut successes = Vec::new();
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+    let mut cancelled = false;
+    while let Some(result) = tasks.join_next().await {
+        let (index, video, result) = result
+            .map_err(|error| AppError::TranslationError(format!("batch task failed: {error}")))?;
+        let current = index + 1;
+        match result {
             Ok(output) => {
-                summary.succeeded.push(output.clone());
+                successes.push((index, output.clone()));
                 send(
                     events,
                     TaskEvent::BatchVideoSucceeded {
@@ -126,14 +198,28 @@ where
                     },
                 );
             }
-            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(AppError::Skipped(_)) => {
+                skipped.push((index, video.clone()));
+                send(
+                    events,
+                    TaskEvent::BatchVideoSkipped {
+                        current,
+                        total,
+                        video,
+                    },
+                );
+            }
+            Err(AppError::Cancelled) => cancelled = true,
             Err(error) => {
                 let error = error.safe_message();
                 warn!(video = %video.display(), error = %error, "batch subtitle pipeline failed for a video");
-                summary.failed.push(BatchFailure {
-                    video: video.clone(),
-                    error: error.clone(),
-                });
+                failures.push((
+                    index,
+                    BatchFailure {
+                        video: video.clone(),
+                        error: error.clone(),
+                    },
+                ));
                 send(
                     events,
                     TaskEvent::BatchVideoFailed {
@@ -147,15 +233,17 @@ where
         }
     }
 
-    Ok(summary)
-}
-
-fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
-    if cancellation.is_cancelled() {
-        Err(AppError::Cancelled)
-    } else {
-        Ok(())
+    if cancelled || cancellation.is_cancelled() {
+        return Err(AppError::Cancelled);
     }
+
+    successes.sort_unstable_by_key(|(index, _)| *index);
+    skipped.sort_unstable_by_key(|(index, _)| *index);
+    failures.sort_unstable_by_key(|(index, _)| *index);
+    summary.succeeded = successes.into_iter().map(|(_, output)| output).collect();
+    summary.skipped = skipped.into_iter().map(|(_, video)| video).collect();
+    summary.failed = failures.into_iter().map(|(_, failure)| failure).collect();
+    Ok(summary)
 }
 
 fn send(sender: &UnboundedSender<TaskEvent>, event: TaskEvent) {
@@ -164,7 +252,11 @@ fn send(sender: &UnboundedSender<TaskEvent>, event: TaskEvent) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::Path};
+    use std::{
+        collections::HashMap,
+        path::Path,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
     use tokio::process::Command;
@@ -245,7 +337,7 @@ mod tests {
             &batch,
             &CancellationToken::new(),
             &events,
-            |job| async move {
+            |job, _pipeline_events| async move {
                 let video = job.video.expect("batch jobs always have a video");
                 if video == *"broken.mkv" {
                     Err(AppError::ProbeFailed("broken fixture".into()))
@@ -289,7 +381,148 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_translates_each_discovered_video_sequentially() {
+    async fn batch_records_skipped_outputs_without_failure() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let batch = BatchJob {
+            videos: vec![PathBuf::from("existing.mkv"), PathBuf::from("fresh.mkv")],
+            subtitle_input: BatchSubtitleInput::Auto,
+            source_language: LanguageCode::auto(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
+            config,
+        };
+        let (events, mut received_events) = unbounded_channel();
+
+        let summary = run_batch_jobs(
+            &batch,
+            &CancellationToken::new(),
+            &events,
+            |job, _pipeline_events| async move {
+                let video = job.video.unwrap();
+                if video == *"existing.mkv" {
+                    Err(AppError::Skipped(video.with_extension("zh-CN.srt")))
+                } else {
+                    Ok(video.with_extension("zh-CN.srt"))
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.succeeded, vec![PathBuf::from("fresh.zh-CN.srt")]);
+        assert_eq!(summary.skipped, vec![PathBuf::from("existing.mkv")]);
+        assert!(summary.failed.is_empty());
+        assert!(
+            std::iter::from_fn(|| received_events.try_recv().ok()).any(|event| matches!(
+                event,
+                TaskEvent::BatchVideoSkipped {
+                    current: 1,
+                    total: 2,
+                    ..
+                }
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_forwards_pipeline_events_with_their_video() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let video = PathBuf::from("episode.mkv");
+        let batch = BatchJob {
+            videos: vec![video.clone()],
+            subtitle_input: BatchSubtitleInput::Auto,
+            source_language: LanguageCode::auto(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
+            config,
+        };
+        let (events, mut received_events) = unbounded_channel();
+
+        run_batch_jobs(
+            &batch,
+            &CancellationToken::new(),
+            &events,
+            |job, pipeline_events| async move {
+                pipeline_events
+                    .send(TaskEvent::TranslationStarted { total: 4 })
+                    .unwrap();
+                pipeline_events
+                    .send(TaskEvent::TranslationProgress {
+                        completed: 2,
+                        total: 4,
+                        request: 1,
+                    })
+                    .unwrap();
+                Ok(job.video.unwrap().with_extension("zh-CN.srt"))
+            },
+        )
+        .await
+        .unwrap();
+
+        let events: Vec<_> = std::iter::from_fn(|| received_events.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TaskEvent::BatchVideoEvent {
+                current: 1,
+                total: 1,
+                video: event_video,
+                event: progress,
+            } if event_video == &video && matches!(
+                progress.as_ref(),
+                TaskEvent::TranslationProgress {
+                    completed: 2,
+                    total: 4,
+                    request: 1,
+                }
+            )
+        )));
+    }
+
+    #[tokio::test]
+    async fn batch_honors_the_configured_video_concurrency() {
+        let config = Config::from_map(&HashMap::from([(
+            "SUBFLUX_BATCH_CONCURRENCY".into(),
+            "2".into(),
+        )]))
+        .unwrap();
+        let batch = BatchJob {
+            videos: (0..4)
+                .map(|index| PathBuf::from(format!("video-{index}.mkv")))
+                .collect(),
+            subtitle_input: BatchSubtitleInput::Auto,
+            source_language: LanguageCode::auto(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
+            config,
+        };
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (events, _received_events) = unbounded_channel();
+
+        let summary = run_batch_jobs(&batch, &CancellationToken::new(), &events, {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |job, _pipeline_events| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                async move {
+                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(count, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(job.video.unwrap().with_extension("zh-CN.srt"))
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(summary.succeeded.len(), 4);
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_translates_each_discovered_video() {
         if !check_tools().is_ready() {
             return;
         }

@@ -16,6 +16,7 @@ use super::{
     openai::{endpoint, parse_translation_json},
     prompt::{system_prompt, user_payload},
     provider::Translator,
+    sse::{SseEvent, read_response},
 };
 
 #[derive(Clone)]
@@ -29,10 +30,10 @@ pub struct AnthropicCompatibleTranslator {
 impl AnthropicCompatibleTranslator {
     pub fn new(config: &TranslatorConfig, timeout: Duration) -> Result<Self> {
         if !config.api_key.is_configured() {
-            return Err(AppError::MissingConfiguration("TRANSLATOR_API_KEY"));
+            return Err(AppError::MissingConfiguration("SUBFLUX_TRANSLATOR_API_KEY"));
         }
         if config.model.trim().is_empty() {
-            return Err(AppError::MissingConfiguration("TRANSLATOR_MODEL"));
+            return Err(AppError::MissingConfiguration("SUBFLUX_TRANSLATOR_MODEL"));
         }
         Ok(Self {
             client: Client::builder()
@@ -57,6 +58,7 @@ impl Translator for AnthropicCompatibleTranslator {
         let payload = AnthropicRequest {
             model: &self.model,
             max_tokens: 4_096,
+            stream: true,
             system: system_prompt(&request),
             messages: vec![AnthropicMessage {
                 role: "user",
@@ -78,30 +80,18 @@ impl Translator for AnthropicCompatibleTranslator {
             () = cancellation.cancelled() => return Err(AppError::Cancelled),
         };
         let status = response.status();
-        let bytes = response.bytes().await.map_err(AppError::Http)?;
+        if !status.is_success() {
+            let bytes = response.bytes().await.map_err(AppError::Http)?;
+            return Err(api_error(status.as_u16(), &bytes, &self.api_key));
+        }
+        let events = read_response(response, cancellation).await?;
+        let content = stream_content(&events)?;
         debug!(
             model = %self.model,
             segments = request.segments.len(),
             elapsed_ms = started.elapsed().as_millis(),
-            "Anthropic-compatible translation response received"
+            "Anthropic-compatible streaming translation response received"
         );
-        if !status.is_success() {
-            return Err(api_error(status.as_u16(), &bytes, &self.api_key));
-        }
-        let response: AnthropicResponse = serde_json::from_slice(&bytes).map_err(|error| {
-            AppError::InvalidApiResponse(format!("invalid messages response JSON: {error}"))
-        })?;
-        let content: String = response
-            .content
-            .into_iter()
-            .filter(|part| part.kind == "text")
-            .filter_map(|part| part.text)
-            .collect();
-        if content.is_empty() {
-            return Err(AppError::InvalidApiResponse(
-                "messages response had no text content".into(),
-            ));
-        }
         let translated = parse_translation_json(&content)?;
         translated.validate_for(&request)?;
         Ok(translated)
@@ -112,6 +102,7 @@ impl Translator for AnthropicCompatibleTranslator {
 struct AnthropicRequest<'a> {
     model: &'a str,
     max_tokens: u32,
+    stream: bool,
     system: String,
     messages: Vec<AnthropicMessage>,
 }
@@ -123,15 +114,44 @@ struct AnthropicMessage {
 }
 
 #[derive(Deserialize)]
-struct AnthropicResponse {
-    content: Vec<AnthropicContent>,
+struct AnthropicStreamEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    delta: Option<AnthropicDelta>,
 }
 
 #[derive(Deserialize)]
-struct AnthropicContent {
+struct AnthropicDelta {
     #[serde(rename = "type")]
-    kind: String,
+    kind: Option<String>,
     text: Option<String>,
+}
+
+fn stream_content(events: &[SseEvent]) -> Result<String> {
+    let mut content = String::new();
+    for event in events {
+        let response: AnthropicStreamEvent =
+            serde_json::from_str(&event.data).map_err(|error| {
+                AppError::InvalidApiResponse(format!("invalid messages SSE JSON: {error}"))
+            })?;
+        if response.kind == "content_block_delta"
+            && response
+                .delta
+                .as_ref()
+                .and_then(|delta| delta.kind.as_deref())
+                == Some("text_delta")
+            && let Some(text) = response.delta.and_then(|delta| delta.text)
+        {
+            content.push_str(&text);
+        }
+    }
+    if content.is_empty() {
+        Err(AppError::InvalidApiResponse(
+            "messages stream had no text content".into(),
+        ))
+    } else {
+        Ok(content)
+    }
 }
 
 fn api_error(status: u16, bytes: &[u8], api_key: &str) -> AppError {
@@ -140,4 +160,31 @@ fn api_error(status: u16, bytes: &[u8], api_key: &str) -> AppError {
         "Anthropic-compatible provider rejected translation request"
     );
     api_response_error(status, bytes, api_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_anthropic_sse_text_deltas() {
+        let content = stream_content(&[
+            SseEvent {
+                event: Some("content_block_delta".into()),
+                data: r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"["}}"#
+                    .into(),
+            },
+            SseEvent {
+                event: Some("content_block_delta".into()),
+                data: r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"{}"}}"#
+                    .into(),
+            },
+            SseEvent {
+                event: Some("message_stop".into()),
+                data: r#"{"type":"message_stop"}"#.into(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(content, "[{}");
+    }
 }

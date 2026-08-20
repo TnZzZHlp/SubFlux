@@ -15,7 +15,7 @@ Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
   Processing, and Result/Error pages.
 - An optional startup path: a video path is prefilled directly, while a
   directory is scanned recursively for supported videos. The selection page
-  can start a sequential batch over every discovered video.
+  can start a configurable-concurrency batch over every discovered video.
 - Auto selection prioritizes text subtitle tracks marked SDH, then the
   default text track, falling back to STT when no text track exists.
 - Manual selection of an embedded track, an external `.srt`, `.ass`, `.ssa`,
@@ -25,7 +25,7 @@ Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
   attachments, comments, and unknown sections remain intact.
 - OpenAI-compatible chat-completions translator and STT client, plus an
   Anthropic-compatible messages translator, built directly with `reqwest` and
-  `serde`.
+  `serde`; translation responses use SSE streaming.
 - Strict ID-based batched translation responses, bounded retries, progress
   events, and cancellation with `C` or `Esc` on the Processing page.
 - Three output modes: translated text only, original-plus-translation
@@ -91,32 +91,33 @@ Configuration is only `.env` in the current working directory. Existing system
 environment variables take precedence over values in `.env`.
 
 ```dotenv
-TRANSLATOR_PROVIDER=openai
-TRANSLATOR_API_FORMAT=openai
-TRANSLATOR_BASE_URL=https://api.example.com/v1
-TRANSLATOR_API_KEY=replace-me
-TRANSLATOR_MODEL=model-name
-TRANSLATOR_CHUNK_SIZE=30
-TRANSLATOR_CONTEXT_BEFORE=10
-TRANSLATOR_CONTEXT_AFTER=5
-TRANSLATOR_MAX_RETRIES=3
+SUBFLUX_TRANSLATOR_PROVIDER=openai
+SUBFLUX_TRANSLATOR_API_FORMAT=openai
+SUBFLUX_TRANSLATOR_BASE_URL=https://api.example.com/v1
+SUBFLUX_TRANSLATOR_API_KEY=replace-me
+SUBFLUX_TRANSLATOR_MODEL=model-name
+SUBFLUX_TRANSLATOR_CHUNK_SIZE=30
+SUBFLUX_TRANSLATOR_CONTEXT_BEFORE=10
+SUBFLUX_TRANSLATOR_CONTEXT_AFTER=5
+SUBFLUX_TRANSLATOR_MAX_RETRIES=3
 
-STT_PROVIDER=openai
-STT_BASE_URL=https://api.example.com/v1
-STT_API_KEY=replace-me
-STT_MODEL=whisper-large-v3
-STT_LANGUAGE=auto
-STT_CHUNK_SECONDS=600
-STT_CHUNK_OVERLAP_SECONDS=2
+SUBFLUX_STT_PROVIDER=openai
+SUBFLUX_STT_BASE_URL=https://api.example.com/v1
+SUBFLUX_STT_API_KEY=replace-me
+SUBFLUX_STT_MODEL=whisper-large-v3
+SUBFLUX_STT_LANGUAGE=auto
+SUBFLUX_STT_CHUNK_SECONDS=600
+SUBFLUX_STT_CHUNK_OVERLAP_SECONDS=2
 
-SOURCE_LANGUAGE=auto
-TARGET_LANGUAGE=zh-CN
-HTTP_TIMEOUT_SECONDS=120
-OUTPUT_OVERWRITE=false
+SUBFLUX_SOURCE_LANGUAGE=auto
+SUBFLUX_TARGET_LANGUAGE=zh-CN
+SUBFLUX_HTTP_TIMEOUT_SECONDS=120
+SUBFLUX_BATCH_CONCURRENCY=1
+SUBFLUX_RUST_LOG=info
 ```
 
-`TRANSLATOR_API_FORMAT=openai` calls `POST /v1/chat/completions` with a Bearer
-token. `TRANSLATOR_API_FORMAT=anthropic` calls `POST /v1/messages` with
+`SUBFLUX_TRANSLATOR_API_FORMAT=openai` calls `POST /v1/chat/completions` with a Bearer
+token. `SUBFLUX_TRANSLATOR_API_FORMAT=anthropic` calls `POST /v1/messages` with
 `x-api-key` and `anthropic-version`. The STT provider calls the
 OpenAI-compatible `POST /v1/audio/transcriptions` endpoint as multipart form
 data with `response_format=verbose_json`; a response without timestamped
@@ -127,20 +128,20 @@ the STT path is actually used, so its key can remain unset for subtitle-only
 workflows.
 
 STT audio is extracted as 16 kHz mono FLAC and transcribed sequentially in
-bounded fragments. `STT_CHUNK_SECONDS` defaults to `600`, which keeps even
+bounded fragments. `SUBFLUX_STT_CHUNK_SECONDS` defaults to `600`, which keeps even
 uncompressed 16 kHz mono audio safely below common 25 MB attachment limits;
-`STT_CHUNK_OVERLAP_SECONDS` defaults to `2` and supplies context on both sides
+`SUBFLUX_STT_CHUNK_OVERLAP_SECONDS` defaults to `2` and supplies context on both sides
 of each boundary. The application assigns each recognized segment to the
 middle, non-overlapping source interval and restores its absolute timestamp.
-Lower `STT_CHUNK_SECONDS` if a provider imposes a smaller request-size limit.
+Lower `SUBFLUX_STT_CHUNK_SECONDS` if a provider imposes a smaller request-size limit.
 
-`TRANSLATOR_CHUNK_SIZE` is the maximum number of subtitle lines that the model
-must translate in one request. `TRANSLATOR_CONTEXT_BEFORE` and
-`TRANSLATOR_CONTEXT_AFTER` add source-language, read-only lines before and
+`SUBFLUX_TRANSLATOR_CHUNK_SIZE` is the maximum number of subtitle lines that the model
+must translate in one request. `SUBFLUX_TRANSLATOR_CONTEXT_BEFORE` and
+`SUBFLUX_TRANSLATOR_CONTEXT_AFTER` add source-language, read-only lines before and
 after that target range to preserve dialogue context. Context lines are never
 included in translation progress or written back. Set both context values to
 `0` to use the original adjacent-chunk behavior. The legacy
-`TRANSLATOR_MAX_SEGMENTS_PER_REQUEST` variable remains accepted when the new
+`SUBFLUX_TRANSLATOR_MAX_SEGMENTS_PER_REQUEST` variable remains accepted when the new
 chunk-size variable is absent.
 
 ## Running and keyboard controls
@@ -152,7 +153,8 @@ subtitle-translator
 subtitle-translator /media/movie.mkv
 
 # Recursively find videos under a directory, then press B in the TUI to
-# translate every discovered video sequentially.
+# translate every discovered video. Set SUBFLUX_BATCH_CONCURRENCY in .env to run
+# multiple videos at once.
 subtitle-translator /media/series
 ```
 
@@ -171,19 +173,23 @@ Batch processing supports **Auto** (each video chooses its own SDH-preferred
 text track, then its default text track, and falls back to STT) and explicit
 **STT**. A selected embedded-track
 index or one external subtitle path cannot safely apply to unrelated videos,
-so those modes are rejected for a batch. Each video is independent: a failure
-or an existing output is recorded and the next video continues. `C` or `Esc`
-cancels the current video and prevents later videos from starting.
+so those modes are rejected for a batch. `SUBFLUX_BATCH_CONCURRENCY` controls how many
+videos run at once and defaults to `1`. The Processing page shows the batch
+total plus one progress bar for every active file; use `↑`/`↓` or
+`PageUp`/`PageDown` to scroll when needed. Each video is independent: a
+failure or an existing output is recorded and the other videos continue. `C`
+or `Esc` cancels the batch and its running videos.
 
 | Key | Action |
 | --- | --- |
 | `Tab`, `↑`, `↓` | Move between Home fields |
 | `←`, `→`, `Enter` | Cycle source, languages, or output type; activate the selected field |
-| `B` | Sequentially process every video discovered from a startup directory |
+| `B` | Process every video discovered from a startup directory |
 | `P` | Probe video subtitle tracks |
 | `T` | Open Subtitle Track Selection |
 | `A` / `X` on track page | Choose Auto / STT |
 | `S` | Open Settings; `R` reloads `.env` |
+| `↑`, `↓`, `PageUp`, `PageDown` during a batch | Scroll active-file progress bars |
 | `C` or `Esc` while processing | Cancel the background task |
 | `Q` | Quit |
 
@@ -215,17 +221,17 @@ the same existing `<name>.<target-language>.<extension>` output name, so select
 the desired type before starting the task.
 
 STT produces SRT by default. A standalone subtitle such as `movie.ja.ass`
-becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs prompt for
-confirmation; `Y`/`Enter` overwrites and `N`/`Esc` skips. Set
-`OUTPUT_OVERWRITE=true` to overwrite without prompting. In a batch,
-the prompt appears separately for each existing output and skipping continues
-with the remaining videos.
+becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs always prompt for confirmation; `Y`/`Enter` overwrites and
+`N`/`Esc` skips. In a batch, the first existing output prompts once; that
+decision applies to every existing output in the batch, which is recorded as
+skipped rather than failed.
 
 ## Known limits in the first version
 
 - No hard-subtitle OCR, PGS OCR, VobSub OCR, or other image-subtitle OCR.
-- No GUI, web UI, WASM, database, directory parallelism, or video
-  re-encoding. Directory batches run sequentially by design.
+- No GUI, web UI, WASM, database, or video re-encoding. Directory batches
+  default to one video at a time; increase `SUBFLUX_BATCH_CONCURRENCY` when the
+  provider and machine can handle more.
 - No subtitle burn-in, remuxing translated subtitles into a video, or video
   re-encoding.
 - STT chunks are processed sequentially and kept in memory until translation;

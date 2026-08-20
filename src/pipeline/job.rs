@@ -1,6 +1,9 @@
 use std::{path::PathBuf, sync::Arc};
 
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    OnceCell,
+    mpsc::{UnboundedSender, unbounded_channel},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -57,11 +60,51 @@ impl PipelineJob {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct BatchOverwrite {
+    decision: Arc<OnceCell<bool>>,
+}
+
+impl BatchOverwrite {
+    async fn confirm(
+        &self,
+        output: &std::path::Path,
+        events: &UnboundedSender<TaskEvent>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let decision = self
+            .decision
+            .get_or_try_init(|| confirm_batch_overwrite(output, events, cancellation))
+            .await?;
+        Ok(*decision)
+    }
+}
+
 pub async fn run_pipeline(
     job: PipelineJob,
     services: Arc<Services>,
     cancellation: CancellationToken,
     events: UnboundedSender<TaskEvent>,
+) -> Result<PathBuf> {
+    run_pipeline_inner(job, services, cancellation, events, None).await
+}
+
+pub(crate) async fn run_pipeline_with_batch_overwrite(
+    job: PipelineJob,
+    services: Arc<Services>,
+    cancellation: CancellationToken,
+    events: UnboundedSender<TaskEvent>,
+    batch_overwrite: BatchOverwrite,
+) -> Result<PathBuf> {
+    run_pipeline_inner(job, services, cancellation, events, Some(&batch_overwrite)).await
+}
+
+async fn run_pipeline_inner(
+    job: PipelineJob,
+    services: Arc<Services>,
+    cancellation: CancellationToken,
+    events: UnboundedSender<TaskEvent>,
+    batch_overwrite: Option<&BatchOverwrite>,
 ) -> Result<PathBuf> {
     check_cancelled(&cancellation)?;
     let mut document = load_document(&job, &services, &cancellation, &events).await?;
@@ -72,20 +115,32 @@ pub async fn run_pipeline(
         &job.target_language,
         document.format,
     )?;
-    let overwrite = if output.exists() && !job.config.output_overwrite {
-        if confirm_overwrite(&output, &events, &cancellation).await? {
+    let overwrite = if output.exists() {
+        let approved = match batch_overwrite {
+            Some(batch_overwrite) => {
+                batch_overwrite
+                    .confirm(&output, &events, &cancellation)
+                    .await?
+            }
+            None => confirm_overwrite(&output, &events, &cancellation).await?,
+        };
+        if approved {
             true
         } else {
-            return Err(AppError::OutputExists(output));
+            return Err(if batch_overwrite.is_some() {
+                AppError::Skipped(output)
+            } else {
+                AppError::OutputExists(output)
+            });
         }
     } else {
-        job.config.output_overwrite
+        false
     };
     if job.output_mode.needs_translation() {
         let translator = services
             .translator
             .as_deref()
-            .ok_or(AppError::MissingConfiguration("TRANSLATOR_API_KEY"))?;
+            .ok_or(AppError::MissingConfiguration("SUBFLUX_TRANSLATOR_API_KEY"))?;
         translate_document(
             &mut document,
             TranslationContext {
@@ -120,6 +175,28 @@ async fn confirm_overwrite(
     let (response, mut responses) = unbounded_channel();
     if events
         .send(TaskEvent::OverwriteRequested {
+            output: output.to_path_buf(),
+            response,
+        })
+        .is_err()
+    {
+        return Err(AppError::OutputExists(output.to_path_buf()));
+    }
+    tokio::select! {
+        decision = responses.recv() => decision.ok_or(AppError::Cancelled),
+        () = cancellation.cancelled() => Err(AppError::Cancelled),
+    }
+}
+
+async fn confirm_batch_overwrite(
+    output: &std::path::Path,
+    events: &UnboundedSender<TaskEvent>,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    check_cancelled(cancellation)?;
+    let (response, mut responses) = unbounded_channel();
+    if events
+        .send(TaskEvent::BatchOverwriteRequested {
             output: output.to_path_buf(),
             response,
         })
@@ -212,7 +289,7 @@ async fn load_stt_document(
     let stt = services
         .stt
         .as_ref()
-        .ok_or(AppError::MissingConfiguration("STT_API_KEY"))?;
+        .ok_or(AppError::MissingConfiguration("SUBFLUX_STT_API_KEY"))?;
     let total = chunks.len();
     let mut results = ChunkedSttResults::default();
     for (index, chunk) in chunks.iter().enumerate() {
@@ -265,7 +342,7 @@ fn send(sender: &UnboundedSender<TaskEvent>, event: TaskEvent) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, path::Path, sync::Arc};
 
     use async_trait::async_trait;
     use tokio::process::Command;
@@ -469,6 +546,94 @@ mod tests {
             tokio::fs::read_to_string(output).await.unwrap(),
             source_content
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_batch_overwrite_skips_an_existing_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("movie.ja.srt");
+        let output = directory.path().join("movie.zh-CN.srt");
+        tokio::fs::write(&source, "1\n00:00:01,000 --> 00:00:02,000\nhello\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&output, "old output").await.unwrap();
+        let services = Arc::new(Services {
+            translator: None,
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, mut received_events) = unbounded_channel();
+        let task = tokio::spawn(run_pipeline_with_batch_overwrite(
+            PipelineJob {
+                video: None,
+                input: SubtitleInput::External(source),
+                source_language: LanguageCode::parse("en").unwrap(),
+                target_language: LanguageCode::parse("zh-CN").unwrap(),
+                output_mode: SubtitleOutputMode::Original,
+                config: Config::from_map(&HashMap::new()).unwrap(),
+            },
+            services,
+            CancellationToken::new(),
+            events,
+            BatchOverwrite::default(),
+        ));
+
+        assert!(matches!(
+            received_events.recv().await,
+            Some(TaskEvent::ExtractingSubtitle)
+        ));
+        let TaskEvent::BatchOverwriteRequested { response, .. } =
+            received_events.recv().await.unwrap()
+        else {
+            panic!("expected batch overwrite prompt");
+        };
+        response.send(false).unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(AppError::Skipped(path)) if path == output
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(output).await.unwrap(),
+            "old output"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_overwrite_confirmation_is_requested_once() {
+        let overwrite = BatchOverwrite::default();
+        let cancellation = CancellationToken::new();
+        let (events, mut received_events) = unbounded_channel();
+        let first = {
+            let overwrite = overwrite.clone();
+            let events = events.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                overwrite
+                    .confirm(Path::new("first.zh-CN.srt"), &events, &cancellation)
+                    .await
+            })
+        };
+        let TaskEvent::BatchOverwriteRequested { response, .. } =
+            received_events.recv().await.unwrap()
+        else {
+            panic!("expected one batch overwrite prompt");
+        };
+        let second = {
+            let overwrite = overwrite.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                overwrite
+                    .confirm(Path::new("second.zh-CN.srt"), &events, &cancellation)
+                    .await
+            })
+        };
+
+        response.send(true).unwrap();
+        assert!(first.await.unwrap().unwrap());
+        assert!(second.await.unwrap().unwrap());
+        assert!(received_events.try_recv().is_err());
     }
 
     #[tokio::test]

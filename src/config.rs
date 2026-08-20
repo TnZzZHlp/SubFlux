@@ -121,7 +121,7 @@ impl TranslatorApiFormat {
             "openai" | "openai-compatible" => Ok(Self::OpenAi),
             "anthropic" | "anthropic-compatible" => Ok(Self::Anthropic),
             other => Err(AppError::InvalidConfig(format!(
-                "TRANSLATOR_API_FORMAT must be openai or anthropic, got {other}"
+                "SUBFLUX_TRANSLATOR_API_FORMAT must be openai or anthropic, got {other}"
             ))),
         }
     }
@@ -169,7 +169,7 @@ pub struct Config {
     pub source_language: LanguageCode,
     pub target_language: LanguageCode,
     pub http_timeout: Duration,
-    pub output_overwrite: bool,
+    pub batch_concurrency: usize,
 }
 
 impl Config {
@@ -212,57 +212,62 @@ impl Config {
 
     fn from_getter(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let get_or = |name: &str, default: &str| get(name).unwrap_or_else(|| default.into());
-        let provider = get_or("TRANSLATOR_PROVIDER", "openai");
+        let provider = get_or("SUBFLUX_TRANSLATOR_PROVIDER", "openai");
         let api_format = TranslatorApiFormat::parse(&get_or(
-            "TRANSLATOR_API_FORMAT",
+            "SUBFLUX_TRANSLATOR_API_FORMAT",
             if provider.eq_ignore_ascii_case("anthropic") {
                 "anthropic"
             } else {
                 "openai"
             },
         ))?;
-        let (chunk_size_name, chunk_size_value) = get("TRANSLATOR_CHUNK_SIZE")
-            .map(|value| ("TRANSLATOR_CHUNK_SIZE", value))
+        let (chunk_size_name, chunk_size_value) = get("SUBFLUX_TRANSLATOR_CHUNK_SIZE")
+            .map(|value| ("SUBFLUX_TRANSLATOR_CHUNK_SIZE", value))
             .or_else(|| {
-                get("TRANSLATOR_MAX_SEGMENTS_PER_REQUEST")
-                    .map(|value| ("TRANSLATOR_MAX_SEGMENTS_PER_REQUEST", value))
+                get("SUBFLUX_TRANSLATOR_MAX_SEGMENTS_PER_REQUEST")
+                    .map(|value| ("SUBFLUX_TRANSLATOR_MAX_SEGMENTS_PER_REQUEST", value))
             })
-            .unwrap_or_else(|| ("TRANSLATOR_CHUNK_SIZE", "30".into()));
+            .unwrap_or_else(|| ("SUBFLUX_TRANSLATOR_CHUNK_SIZE", "30".into()));
         let chunk_size = parse_positive_usize(chunk_size_name, &chunk_size_value)?;
         let context_before = parse_usize(
-            "TRANSLATOR_CONTEXT_BEFORE",
-            &get_or("TRANSLATOR_CONTEXT_BEFORE", "10"),
+            "SUBFLUX_TRANSLATOR_CONTEXT_BEFORE",
+            &get_or("SUBFLUX_TRANSLATOR_CONTEXT_BEFORE", "10"),
         )?;
         let context_after = parse_usize(
-            "TRANSLATOR_CONTEXT_AFTER",
-            &get_or("TRANSLATOR_CONTEXT_AFTER", "5"),
+            "SUBFLUX_TRANSLATOR_CONTEXT_AFTER",
+            &get_or("SUBFLUX_TRANSLATOR_CONTEXT_AFTER", "5"),
         )?;
         let max_retries = parse_usize(
-            "TRANSLATOR_MAX_RETRIES",
-            &get_or("TRANSLATOR_MAX_RETRIES", "3"),
+            "SUBFLUX_TRANSLATOR_MAX_RETRIES",
+            &get_or("SUBFLUX_TRANSLATOR_MAX_RETRIES", "3"),
         )?;
-        let stt_chunk_seconds =
-            parse_positive_u64("STT_CHUNK_SECONDS", &get_or("STT_CHUNK_SECONDS", "600"))?;
+        let stt_chunk_seconds = parse_positive_u64(
+            "SUBFLUX_STT_CHUNK_SECONDS",
+            &get_or("SUBFLUX_STT_CHUNK_SECONDS", "600"),
+        )?;
         let stt_chunk_overlap_seconds = parse_u64(
-            "STT_CHUNK_OVERLAP_SECONDS",
-            &get_or("STT_CHUNK_OVERLAP_SECONDS", "2"),
+            "SUBFLUX_STT_CHUNK_OVERLAP_SECONDS",
+            &get_or("SUBFLUX_STT_CHUNK_OVERLAP_SECONDS", "2"),
         )?;
         if stt_chunk_overlap_seconds >= stt_chunk_seconds {
             return Err(AppError::InvalidConfig(
-                "STT_CHUNK_OVERLAP_SECONDS must be less than STT_CHUNK_SECONDS".into(),
+                "SUBFLUX_STT_CHUNK_OVERLAP_SECONDS must be less than SUBFLUX_STT_CHUNK_SECONDS"
+                    .into(),
             ));
         }
         let timeout_seconds = parse_positive_u64(
-            "HTTP_TIMEOUT_SECONDS",
-            &get_or("HTTP_TIMEOUT_SECONDS", "120"),
+            "SUBFLUX_HTTP_TIMEOUT_SECONDS",
+            &get_or("SUBFLUX_HTTP_TIMEOUT_SECONDS", "120"),
         )?;
-        let output_overwrite =
-            parse_bool("OUTPUT_OVERWRITE", &get_or("OUTPUT_OVERWRITE", "false"))?;
+        let batch_concurrency = parse_positive_usize(
+            "SUBFLUX_BATCH_CONCURRENCY",
+            &get_or("SUBFLUX_BATCH_CONCURRENCY", "1"),
+        )?;
 
-        let target_language = LanguageCode::parse(get_or("TARGET_LANGUAGE", "zh-CN"))?;
+        let target_language = LanguageCode::parse(get_or("SUBFLUX_TARGET_LANGUAGE", "zh-CN"))?;
         if target_language == LanguageCode::auto() {
             return Err(AppError::InvalidConfig(
-                "TARGET_LANGUAGE cannot be auto; choose a BCP 47 code".into(),
+                "SUBFLUX_TARGET_LANGUAGE cannot be auto; choose a BCP 47 code".into(),
             ));
         }
 
@@ -270,27 +275,27 @@ impl Config {
             translator: TranslatorConfig {
                 provider,
                 api_format,
-                base_url: get_or("TRANSLATOR_BASE_URL", "https://api.openai.com/v1"),
-                api_key: ApiKey::new(get_or("TRANSLATOR_API_KEY", "")),
-                model: get_or("TRANSLATOR_MODEL", "gpt-4o-mini"),
+                base_url: get_or("SUBFLUX_TRANSLATOR_BASE_URL", "https://api.openai.com/v1"),
+                api_key: ApiKey::new(get_or("SUBFLUX_TRANSLATOR_API_KEY", "")),
+                model: get_or("SUBFLUX_TRANSLATOR_MODEL", "gpt-4o-mini"),
                 chunk_size,
                 context_before,
                 context_after,
                 max_retries,
             },
             stt: SttConfig {
-                provider: get_or("STT_PROVIDER", "openai"),
-                base_url: get_or("STT_BASE_URL", "https://api.openai.com/v1"),
-                api_key: ApiKey::new(get_or("STT_API_KEY", "")),
-                model: get_or("STT_MODEL", "whisper-1"),
-                language: LanguageCode::parse(get_or("STT_LANGUAGE", "auto"))?,
+                provider: get_or("SUBFLUX_STT_PROVIDER", "openai"),
+                base_url: get_or("SUBFLUX_STT_BASE_URL", "https://api.openai.com/v1"),
+                api_key: ApiKey::new(get_or("SUBFLUX_STT_API_KEY", "")),
+                model: get_or("SUBFLUX_STT_MODEL", "whisper-1"),
+                language: LanguageCode::parse(get_or("SUBFLUX_STT_LANGUAGE", "auto"))?,
                 chunk_seconds: stt_chunk_seconds,
                 chunk_overlap_seconds: stt_chunk_overlap_seconds,
             },
-            source_language: LanguageCode::parse(get_or("SOURCE_LANGUAGE", "auto"))?,
+            source_language: LanguageCode::parse(get_or("SUBFLUX_SOURCE_LANGUAGE", "auto"))?,
             target_language,
             http_timeout: Duration::from_secs(timeout_seconds),
-            output_overwrite,
+            batch_concurrency,
         })
     }
 }
@@ -329,16 +334,6 @@ fn parse_positive_u64(name: &str, value: &str) -> Result<u64> {
     }
 }
 
-fn parse_bool(name: &str, value: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        _ => Err(AppError::InvalidConfig(format!(
-            "{name} must be true or false"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,7 +347,7 @@ mod tests {
     #[test]
     fn validates_target_language() {
         let mut values = HashMap::new();
-        values.insert("TARGET_LANGUAGE".into(), "auto".into());
+        values.insert("SUBFLUX_TARGET_LANGUAGE".into(), "auto".into());
         assert!(matches!(
             Config::from_map(&values),
             Err(AppError::InvalidConfig(_))
@@ -362,9 +357,9 @@ mod tests {
     #[test]
     fn loads_context_window_and_accepts_zero_context() {
         let values = HashMap::from([
-            ("TRANSLATOR_CHUNK_SIZE".into(), "12".into()),
-            ("TRANSLATOR_CONTEXT_BEFORE".into(), "0".into()),
-            ("TRANSLATOR_CONTEXT_AFTER".into(), "0".into()),
+            ("SUBFLUX_TRANSLATOR_CHUNK_SIZE".into(), "12".into()),
+            ("SUBFLUX_TRANSLATOR_CONTEXT_BEFORE".into(), "0".into()),
+            ("SUBFLUX_TRANSLATOR_CONTEXT_AFTER".into(), "0".into()),
         ]);
         let config = Config::from_map(&values).unwrap();
         assert_eq!(config.translator.chunk_size, 12);
@@ -374,10 +369,13 @@ mod tests {
 
     #[test]
     fn supports_legacy_chunk_size_and_rejects_zero_new_chunk_size() {
-        let legacy = HashMap::from([("TRANSLATOR_MAX_SEGMENTS_PER_REQUEST".into(), "7".into())]);
+        let legacy = HashMap::from([(
+            "SUBFLUX_TRANSLATOR_MAX_SEGMENTS_PER_REQUEST".into(),
+            "7".into(),
+        )]);
         assert_eq!(Config::from_map(&legacy).unwrap().translator.chunk_size, 7);
 
-        let zero = HashMap::from([("TRANSLATOR_CHUNK_SIZE".into(), "0".into())]);
+        let zero = HashMap::from([("SUBFLUX_TRANSLATOR_CHUNK_SIZE".into(), "0".into())]);
         assert!(matches!(
             Config::from_map(&zero),
             Err(AppError::InvalidConfig(_))
@@ -387,19 +385,31 @@ mod tests {
     #[test]
     fn loads_stt_chunk_configuration_and_rejects_an_invalid_overlap() {
         let values = HashMap::from([
-            ("STT_CHUNK_SECONDS".into(), "480".into()),
-            ("STT_CHUNK_OVERLAP_SECONDS".into(), "3".into()),
+            ("SUBFLUX_STT_CHUNK_SECONDS".into(), "480".into()),
+            ("SUBFLUX_STT_CHUNK_OVERLAP_SECONDS".into(), "3".into()),
         ]);
         let config = Config::from_map(&values).unwrap();
         assert_eq!(config.stt.chunk_seconds, 480);
         assert_eq!(config.stt.chunk_overlap_seconds, 3);
 
         let invalid = HashMap::from([
-            ("STT_CHUNK_SECONDS".into(), "10".into()),
-            ("STT_CHUNK_OVERLAP_SECONDS".into(), "10".into()),
+            ("SUBFLUX_STT_CHUNK_SECONDS".into(), "10".into()),
+            ("SUBFLUX_STT_CHUNK_OVERLAP_SECONDS".into(), "10".into()),
         ]);
         assert!(matches!(
             Config::from_map(&invalid),
+            Err(AppError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn loads_and_validates_batch_concurrency() {
+        let values = HashMap::from([("SUBFLUX_BATCH_CONCURRENCY".into(), "3".into())]);
+        assert_eq!(Config::from_map(&values).unwrap().batch_concurrency, 3);
+
+        let zero = HashMap::from([("SUBFLUX_BATCH_CONCURRENCY".into(), "0".into())]);
+        assert!(matches!(
+            Config::from_map(&zero),
             Err(AppError::InvalidConfig(_))
         ));
     }
