@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -17,6 +18,7 @@ use super::{
     prompt::{system_prompt, user_payload},
     provider::Translator,
     sse::{SseEvent, read_response},
+    structured_output::{rejects_structured_output_field, translation_schema},
 };
 
 #[derive(Clone)]
@@ -45,6 +47,25 @@ impl AnthropicCompatibleTranslator {
             model: config.model.clone(),
         })
     }
+
+    async fn send_request(
+        &self,
+        payload: &AnthropicRequest<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<reqwest::Response> {
+        let send = self
+            .client
+            .post(self.endpoint.clone())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(payload)
+            .send();
+        tokio::select! {
+            result = send => result.map_err(AppError::Http),
+            () = cancellation.cancelled() => Err(AppError::Cancelled),
+        }
+    }
 }
 
 #[async_trait]
@@ -55,7 +76,7 @@ impl Translator for AnthropicCompatibleTranslator {
         cancellation: &CancellationToken,
     ) -> Result<TranslationResponse> {
         let input = user_payload(&request)?;
-        let payload = AnthropicRequest {
+        let mut payload = AnthropicRequest {
             model: &self.model,
             max_tokens: 4_096,
             stream: true,
@@ -64,21 +85,24 @@ impl Translator for AnthropicCompatibleTranslator {
                 role: "user",
                 content: input,
             }],
+            output_config: Some(output_config(&request)),
         };
         debug!(model = %self.model, segments = request.segments.len(), "sending Anthropic-compatible translation request");
         let started = Instant::now();
-        let send = self
-            .client
-            .post(self.endpoint.clone())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header(header::CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send();
-        let response = tokio::select! {
-            result = send => result.map_err(AppError::Http)?,
-            () = cancellation.cancelled() => return Err(AppError::Cancelled),
-        };
+        let mut response = self.send_request(&payload, cancellation).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let bytes = response.bytes().await.map_err(AppError::Http)?;
+            if !rejects_structured_output_field(status.as_u16(), &bytes, "output_config") {
+                return Err(api_error(status.as_u16(), &bytes, &self.api_key));
+            }
+            warn!(
+                status = status.as_u16(),
+                "Anthropic-compatible provider rejected output_config; retrying without structured output"
+            );
+            payload.output_config = None;
+            response = self.send_request(&payload, cancellation).await?;
+        }
         let status = response.status();
         if !status.is_success() {
             let bytes = response.bytes().await.map_err(AppError::Http)?;
@@ -105,6 +129,8 @@ struct AnthropicRequest<'a> {
     stream: bool,
     system: String,
     messages: Vec<AnthropicMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -125,6 +151,15 @@ struct AnthropicDelta {
     #[serde(rename = "type")]
     kind: Option<String>,
     text: Option<String>,
+}
+
+fn output_config(request: &TranslationRequest) -> Value {
+    json!({
+        "format": {
+            "type": "json_schema",
+            "schema": translation_schema(request),
+        },
+    })
 }
 
 fn stream_content(events: &[SseEvent]) -> Result<String> {
@@ -205,6 +240,58 @@ mod tests {
         assert_eq!(
             parse_translation_json(&content).unwrap().entries[0].text,
             "first\nsecond"
+        );
+    }
+
+    #[test]
+    fn serializes_structured_output_config() {
+        let request = TranslationRequest {
+            source_language: crate::config::LanguageCode::parse("ja").unwrap(),
+            target_language: crate::config::LanguageCode::parse("zh-CN").unwrap(),
+            previous_context: Vec::new(),
+            segments: vec![crate::translator::TranslationItem {
+                id: 101,
+                text: "one".into(),
+            }],
+            next_context: Vec::new(),
+        };
+        let payload = AnthropicRequest {
+            model: "model",
+            max_tokens: 4_096,
+            stream: true,
+            system: String::new(),
+            messages: Vec::new(),
+            output_config: Some(output_config(&request)),
+        };
+        let body = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        let translations = &body["output_config"]["format"]["schema"]["properties"]["translations"];
+        assert!(translations.get("minItems").is_none());
+        assert!(translations.get("maxItems").is_none());
+        assert_eq!(
+            translations["items"]["properties"]["id"]["enum"],
+            serde_json::json!([101])
+        );
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn omits_output_config_for_fallback_requests() {
+        let payload = AnthropicRequest {
+            model: "model",
+            max_tokens: 4_096,
+            stream: true,
+            system: String::new(),
+            messages: Vec::new(),
+            output_config: None,
+        };
+
+        assert!(
+            serde_json::to_value(payload)
+                .unwrap()
+                .get("output_config")
+                .is_none()
         );
     }
 }

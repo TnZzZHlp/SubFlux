@@ -117,11 +117,14 @@ SUBFLUX_RUST_LOG=info
 ```
 
 `SUBFLUX_TRANSLATOR_API_FORMAT=openai` calls `POST /v1/chat/completions` with a Bearer
-token. `SUBFLUX_TRANSLATOR_API_FORMAT=anthropic` calls `POST /v1/messages` with
-`x-api-key` and `anthropic-version`. The STT provider calls the
-OpenAI-compatible `POST /v1/audio/transcriptions` endpoint as multipart form
-data with `response_format=verbose_json`; a response without timestamped
-`segments` is rejected.
+token and strict `response_format.json_schema`. `SUBFLUX_TRANSLATOR_API_FORMAT=anthropic`
+calls `POST /v1/messages` with `x-api-key`, `anthropic-version`, and Anthropic's
+`output_config.format` JSON schema. If a compatible service explicitly rejects its
+structured-output field, SubFlux retries that request once without the field. Authentication,
+network, timeout, rate-limit, schema, and other API errors do not trigger this fallback. The
+STT provider calls the OpenAI-compatible `POST /v1/audio/transcriptions` endpoint as multipart
+form data with `response_format=verbose_json`; a response without timestamped `segments` is
+rejected.
 
 For an existing subtitle only the translator key is needed. STT is checked when
 the STT path is actually used, so its key can remain unset for subtitle-only

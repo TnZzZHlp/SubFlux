@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -17,6 +17,7 @@ use super::{
     prompt::{system_prompt, user_payload},
     provider::Translator,
     sse::{SseEvent, read_response},
+    structured_output::{openai_translation_schema, rejects_structured_output_field},
 };
 
 #[derive(Clone)]
@@ -45,6 +46,23 @@ impl OpenAiCompatibleTranslator {
             model: config.model.clone(),
         })
     }
+
+    async fn send_request(
+        &self,
+        payload: &OpenAiRequest<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<reqwest::Response> {
+        let send = self
+            .client
+            .post(self.endpoint.clone())
+            .header(header::AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .json(payload)
+            .send();
+        tokio::select! {
+            result = send => result.map_err(AppError::Http),
+            () = cancellation.cancelled() => Err(AppError::Cancelled),
+        }
+    }
 }
 
 #[async_trait]
@@ -54,7 +72,7 @@ impl Translator for OpenAiCompatibleTranslator {
         request: TranslationRequest,
         cancellation: &CancellationToken,
     ) -> Result<TranslationResponse> {
-        let payload = OpenAiRequest {
+        let mut payload = OpenAiRequest {
             model: &self.model,
             temperature: 0.2,
             stream: true,
@@ -68,19 +86,24 @@ impl Translator for OpenAiCompatibleTranslator {
                     content: user_payload(&request)?,
                 },
             ],
+            response_format: Some(response_format(&request)),
         };
         debug!(model = %self.model, segments = request.segments.len(), "sending OpenAI-compatible translation request");
         let started = Instant::now();
-        let send = self
-            .client
-            .post(self.endpoint.clone())
-            .header(header::AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .json(&payload)
-            .send();
-        let response = tokio::select! {
-            result = send => result.map_err(AppError::Http)?,
-            () = cancellation.cancelled() => return Err(AppError::Cancelled),
-        };
+        let mut response = self.send_request(&payload, cancellation).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let bytes = response.bytes().await.map_err(AppError::Http)?;
+            if !rejects_structured_output_field(status.as_u16(), &bytes, "response_format") {
+                return Err(api_error(status.as_u16(), &bytes, &self.api_key));
+            }
+            warn!(
+                status = status.as_u16(),
+                "OpenAI-compatible provider rejected response_format; retrying without structured output"
+            );
+            payload.response_format = None;
+            response = self.send_request(&payload, cancellation).await?;
+        }
         let status = response.status();
         if !status.is_success() {
             let bytes = response.bytes().await.map_err(AppError::Http)?;
@@ -106,6 +129,8 @@ struct OpenAiRequest<'a> {
     temperature: f32,
     stream: bool,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -127,6 +152,17 @@ struct OpenAiStreamChoice {
 #[derive(Deserialize)]
 struct OpenAiDelta {
     content: Option<String>,
+}
+
+fn response_format(request: &TranslationRequest) -> Value {
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "subtitle_translations",
+            "strict": true,
+            "schema": openai_translation_schema(request),
+        },
+    })
 }
 
 fn stream_content(events: &[SseEvent]) -> Result<String> {
@@ -333,6 +369,57 @@ mod tests {
         assert_eq!(
             parse_translation_json(&content).unwrap().entries[0].text,
             "first\nsecond"
+        );
+    }
+
+    #[test]
+    fn serializes_strict_response_format() {
+        let request = TranslationRequest {
+            source_language: crate::config::LanguageCode::parse("ja").unwrap(),
+            target_language: crate::config::LanguageCode::parse("zh-CN").unwrap(),
+            previous_context: Vec::new(),
+            segments: vec![crate::translator::TranslationItem {
+                id: 101,
+                text: "one".into(),
+            }],
+            next_context: Vec::new(),
+        };
+        let payload = OpenAiRequest {
+            model: "model",
+            temperature: 0.2,
+            stream: true,
+            messages: Vec::new(),
+            response_format: Some(response_format(&request)),
+        };
+        let body = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "subtitle_translations"
+        );
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["properties"]["translations"]["maxItems"],
+            1
+        );
+    }
+
+    #[test]
+    fn omits_response_format_for_fallback_requests() {
+        let payload = OpenAiRequest {
+            model: "model",
+            temperature: 0.2,
+            stream: true,
+            messages: Vec::new(),
+            response_format: None,
+        };
+
+        assert!(
+            serde_json::to_value(payload)
+                .unwrap()
+                .get("response_format")
+                .is_none()
         );
     }
 }

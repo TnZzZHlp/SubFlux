@@ -165,6 +165,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_extra_translation_entries() {
+        let result = TranslationResponse {
+            entries: vec![
+                TranslationItem {
+                    id: 101,
+                    text: "x".into(),
+                },
+                TranslationItem {
+                    id: 102,
+                    text: "y".into(),
+                },
+                TranslationItem {
+                    id: 103,
+                    text: "z".into(),
+                },
+            ],
+        }
+        .validate_for(&request());
+
+        assert!(matches!(
+            result,
+            Err(AppError::InvalidApiResponse(message)) if message == "expected 2 translations but received 3"
+        ));
+    }
+
+    #[test]
     fn rejects_context_ids_empty_translations_and_reordered_entries() {
         let request = request();
         for response in [

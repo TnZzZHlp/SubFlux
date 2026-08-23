@@ -5,6 +5,7 @@ pub mod openai;
 pub(crate) mod prompt;
 pub mod provider;
 mod sse;
+mod structured_output;
 
 use std::sync::Arc;
 

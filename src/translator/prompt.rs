@@ -12,8 +12,8 @@ pub fn system_prompt(request: &TranslationRequest) -> String {
         "Translate subtitle text from {} to {}. The user message is a JSON object with \
          previous_context, segments, and next_context. previous_context and next_context are \
          read-only context to help comprehension: never translate or return either context list. \
-         Translate only segments. Return JSON only, with exactly this array shape: \
-         [{{\"id\":123,\"text\":\"translated text\"}}]. The result count and order must exactly \
+         Translate only segments. Return JSON only, with exactly this object shape: \
+         {{\"translations\":[{{\"id\":123,\"text\":\"translated text\"}}]}}. The result count and order must exactly \
          match segments. Preserve every segments id exactly once; do not add, remove, modify, \
          merge, or split entries. Do not return explanations or Markdown. Translate only text; \
          formatting tags are intentionally absent from the input and must not be invented.",
@@ -87,5 +87,6 @@ mod tests {
         let prompt = system_prompt(&request());
         assert!(prompt.contains("Translate only segments"));
         assert!(prompt.contains("never translate or return either context list"));
+        assert!(prompt.contains(r#"{"translations":[{"id":123,"text":"translated text"}]}"#));
     }
 }
