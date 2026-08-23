@@ -187,4 +187,24 @@ mod tests {
         .unwrap();
         assert_eq!(content, "[{}");
     }
+
+    #[test]
+    fn parses_streamed_translation_with_raw_newline() {
+        let translation = "[{\"id\":1,\"text\":\"first\nsecond\"}]";
+        let data = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": translation},
+        })
+        .to_string();
+        let content = stream_content(&[SseEvent {
+            event: Some("content_block_delta".into()),
+            data,
+        }])
+        .unwrap();
+
+        assert_eq!(
+            parse_translation_json(&content).unwrap().entries[0].text,
+            "first\nsecond"
+        );
+    }
 }

@@ -169,8 +169,8 @@ pub(crate) fn endpoint(base_url: &str, suffix: &str) -> Result<Url> {
 }
 
 pub(crate) fn parse_translation_json(content: &str) -> Result<TranslationResponse> {
-    let content = strip_code_fence(content.trim());
-    let value: Value = serde_json::from_str(content)
+    let content = escape_unescaped_string_controls(strip_code_fence(trim_json_whitespace(content)));
+    let value: Value = serde_json::from_str(&content)
         .map_err(|error| AppError::InvalidApiResponse(format!("response was not JSON: {error}")))?;
     let entries_value = match value {
         Value::Array(_) => value,
@@ -189,6 +189,38 @@ pub(crate) fn parse_translation_json(content: &str) -> Result<TranslationRespons
     Ok(TranslationResponse { entries })
 }
 
+fn escape_unescaped_string_controls(content: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut escaped = false;
+    let mut in_string = false;
+    let mut normalized = String::with_capacity(content.len());
+    for character in content.chars() {
+        if in_string && !escaped && character <= '\u{001F}' {
+            let value = character as u8;
+            normalized.push_str("\\u00");
+            normalized.push(char::from(HEX[usize::from(value >> 4)]));
+            normalized.push(char::from(HEX[usize::from(value & 0x0F)]));
+        } else {
+            normalized.push(character);
+        }
+
+        if in_string {
+            if character == '\\' {
+                escaped = !escaped;
+            } else {
+                if character == '"' && !escaped {
+                    in_string = false;
+                }
+                escaped = false;
+            }
+        } else if character == '"' {
+            in_string = true;
+        }
+    }
+    normalized
+}
+
 fn strip_code_fence(content: &str) -> &str {
     content
         .strip_prefix("```json")
@@ -197,8 +229,13 @@ fn strip_code_fence(content: &str) -> &str {
         .map_or(content, strip_code_fence_content)
 }
 
+fn trim_json_whitespace(content: &str) -> &str {
+    content.trim_matches([' ', '\t', '\n', '\r'])
+}
+
 fn strip_code_fence_content(inner: &str) -> &str {
-    inner.trim().strip_suffix("```").unwrap_or(inner).trim()
+    let inner = trim_json_whitespace(inner);
+    trim_json_whitespace(inner.strip_suffix("```").unwrap_or(inner))
 }
 
 fn api_error(status: u16, bytes: &[u8], api_key: &str) -> AppError {
@@ -248,6 +285,54 @@ mod tests {
                 .entries
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn repairs_unescaped_controls_inside_translation_text() {
+        let raw_controls = format!("NUL:\0 LF:\n CR:\r TAB:\t SOH:{}", '\u{0001}');
+        let response = format!("```json\n[{{\"id\":1,\"text\":\"{raw_controls}\"}}]\n```");
+
+        assert_eq!(
+            parse_translation_json(&response).unwrap().entries[0].text,
+            raw_controls
+        );
+    }
+
+    #[test]
+    fn preserves_valid_escapes_while_repairing_raw_controls() {
+        let response = r#"[{"id":1,"text":"escaped quote: \" and slash: \\; raw:
+"}]"#;
+
+        assert_eq!(
+            parse_translation_json(response).unwrap().entries[0].text,
+            "escaped quote: \" and slash: \\; raw:\n"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_controls_outside_json_strings() {
+        for control in ['\0', '\u{000B}', '\u{000C}'] {
+            let response = format!("{control}[{{\"id\":1,\"text\":\"ok\"}}]{control}");
+            assert!(matches!(
+                parse_translation_json(&response),
+                Err(AppError::InvalidApiResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn parses_streamed_translation_with_raw_newline() {
+        let translation = "[{\"id\":1,\"text\":\"first\nsecond\"}]";
+        let data = serde_json::json!({
+            "choices": [{"delta": {"content": translation}}],
+        })
+        .to_string();
+        let content = stream_content(&[SseEvent { event: None, data }]).unwrap();
+
+        assert_eq!(
+            parse_translation_json(&content).unwrap().entries[0].text,
+            "first\nsecond"
         );
     }
 }
