@@ -200,7 +200,9 @@ mod tests {
         document
             .apply_translation(SubtitleId(1), "你好 Alice".into())
             .unwrap();
-        let output = document.render().unwrap();
+        let output = document
+            .render_with_mode(crate::subtitle::SubtitleOutputMode::Translated)
+            .unwrap();
         assert!(output.contains("Title: Keep me"));
         assert!(output.contains("Style: Default,Arial,42,&H00FFFFFF"));
         assert!(output.contains("Comment: 0,0:00:00.00"));
@@ -222,8 +224,13 @@ mod tests {
             .apply_translation(SubtitleId(1), "translated".into())
             .unwrap();
         assert_eq!(document.format, SubtitleFormat::Ssa);
-        assert!(document.render().unwrap().contains(
-            "Dialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0000,0000,0000,,translated"
-        ));
+        assert!(
+            document
+                .render_with_mode(crate::subtitle::SubtitleOutputMode::Translated)
+                .unwrap()
+                .contains(
+                    "Dialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0000,0000,0000,,translated"
+                )
+        );
     }
 }

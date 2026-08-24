@@ -149,7 +149,9 @@ mod tests {
         document
             .apply_translation(SubtitleId(1), "你好".into())
             .unwrap();
-        let output = document.render().unwrap();
+        let output = document
+            .render_with_mode(crate::subtitle::SubtitleOutputMode::Translated)
+            .unwrap();
         assert!(output.starts_with("WEBVTT - example\n\nNOTE untouched\nhello\n"));
         assert!(output.contains("00:01.000 --> 00:03.000 line:90%\n<c.red>你好</c>"));
     }

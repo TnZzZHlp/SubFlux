@@ -2,7 +2,7 @@ use serde_json::{Map, Value, json};
 
 use super::TranslationRequest;
 
-pub(crate) fn openai_translation_schema(request: &TranslationRequest) -> Value {
+pub fn openai_translation_schema(request: &TranslationRequest) -> Value {
     let mut schema = translation_schema(request);
     let count = request.segments.len();
     schema["properties"]["translations"]["minItems"] = Value::from(count);
@@ -10,7 +10,7 @@ pub(crate) fn openai_translation_schema(request: &TranslationRequest) -> Value {
     schema
 }
 
-pub(crate) fn translation_schema(request: &TranslationRequest) -> Value {
+pub fn translation_schema(request: &TranslationRequest) -> Value {
     let ids = request
         .segments
         .iter()
@@ -38,11 +38,10 @@ pub(crate) fn translation_schema(request: &TranslationRequest) -> Value {
     })
 }
 
-pub(crate) fn rejects_structured_output_field(status: u16, body: &[u8], field: &str) -> bool {
+pub fn rejects_structured_output_field(status: u16, body: &[u8], field: &str) -> bool {
     matches!(status, 400 | 422)
         && serde_json::from_slice::<Value>(body)
-            .ok()
-            .is_some_and(|value| value_rejects_field(&value, field))
+            .is_ok_and(|value| value_rejects_field(&value, field))
 }
 
 fn value_rejects_field(value: &Value, field: &str) -> bool {

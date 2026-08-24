@@ -12,4 +12,12 @@ pub trait Translator: Send + Sync {
         request: TranslationRequest,
         cancellation: &CancellationToken,
     ) -> Result<TranslationResponse>;
+
+    async fn translate_correction(
+        &self,
+        request: TranslationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<TranslationResponse> {
+        self.translate(request, cancellation).await
+    }
 }

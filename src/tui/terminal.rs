@@ -1,6 +1,7 @@
 use std::io::{self, Stdout, stdout};
 
 use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -17,14 +18,21 @@ pub struct TuiTerminal {
 impl TuiTerminal {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        let mut stdout = stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let mut output = stdout();
+        if let Err(error) = execute!(output, EnterAlternateScreen, EnableBracketedPaste) {
+            let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(error);
         }
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        let backend = CrosstermBackend::new(output);
+        match Terminal::new(backend) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(error) => {
+                let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                Err(error)
+            }
+        }
     }
 
     pub fn draw(&mut self, app: &App) -> io::Result<()> {
@@ -36,8 +44,12 @@ impl TuiTerminal {
 
 impl Drop for TuiTerminal {
     fn drop(&mut self) {
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
     }
 }

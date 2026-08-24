@@ -35,7 +35,7 @@ pub enum TaskEvent {
         current: usize,
         total: usize,
         video: PathBuf,
-        event: Box<TaskEvent>,
+        event: Box<Self>,
     },
     BatchVideoSucceeded {
         current: usize,
@@ -52,6 +52,26 @@ pub enum TaskEvent {
         current: usize,
         total: usize,
         video: PathBuf,
+        error: String,
+    },
+    BatchRetrySucceeded {
+        failed_index: usize,
+        output: PathBuf,
+    },
+    BatchRetrySkipped {
+        failed_index: usize,
+    },
+    BatchRetryFailed {
+        failed_index: usize,
+        error: String,
+    },
+    BatchRetryCancelled,
+    ProbeSucceeded {
+        request_id: u64,
+        probe: MediaProbe,
+    },
+    ProbeFailed {
+        request_id: u64,
         error: String,
     },
     Probing,

@@ -7,6 +7,7 @@ use crate::event::TaskEvent;
 #[derive(Clone, Debug)]
 pub enum Action {
     Key(KeyEvent),
+    Paste(String),
     Task(Box<TaskEvent>),
     Tick,
 }

@@ -105,19 +105,41 @@ fn append_status_message(app: &mut App, message: &str) {
     ));
 }
 
+fn batch_retry_event(
+    failed_index: usize,
+    result: std::result::Result<PathBuf, AppError>,
+) -> TaskEvent {
+    match result {
+        Ok(output) => TaskEvent::BatchRetrySucceeded {
+            failed_index,
+            output,
+        },
+        Err(AppError::OutputExists(_) | AppError::Skipped(_)) => {
+            TaskEvent::BatchRetrySkipped { failed_index }
+        }
+        Err(AppError::Cancelled) => TaskEvent::BatchRetryCancelled,
+        Err(error) => TaskEvent::BatchRetryFailed {
+            failed_index,
+            error: error.safe_message(),
+        },
+    }
+}
+
 fn execute(command: Command, events: tokio::sync::mpsc::UnboundedSender<TaskEvent>) -> bool {
     match command {
-        Command::Probe(path) => {
+        Command::Probe { path, request_id } => {
             tokio::spawn(async move {
-                let _ = events.send(TaskEvent::Probing);
                 match probe_media(&path).await {
                     Ok(probe) => {
-                        let _ = events.send(TaskEvent::TracksLoaded(probe));
+                        let _ = events.send(TaskEvent::ProbeSucceeded { request_id, probe });
                     }
                     Err(error) => {
                         let message = error.safe_message();
                         warn!(error = %message, "media probe failed");
-                        let _ = events.send(TaskEvent::Failed(message));
+                        let _ = events.send(TaskEvent::ProbeFailed {
+                            request_id,
+                            error: message,
+                        });
                     }
                 }
             });
@@ -178,6 +200,37 @@ fn execute(command: Command, events: tokio::sync::mpsc::UnboundedSender<TaskEven
                         let _ = events.send(TaskEvent::Failed(message));
                     }
                 }
+            });
+            true
+        }
+        Command::RetryBatchVideo {
+            job,
+            failed_index,
+            cancellation,
+        } => {
+            tokio::spawn(async move {
+                let job = *job;
+                let services =
+                    match Services::from_config(&job.config, job.output_mode.needs_translation()) {
+                        Ok(services) => Arc::new(services),
+                        Err(error) => {
+                            let message = error.safe_message();
+                            error!(error = %message, "batch retry provider setup failed");
+                            let _ = events.send(TaskEvent::BatchRetryFailed {
+                                failed_index,
+                                error: message,
+                            });
+                            return;
+                        }
+                    };
+                let event = batch_retry_event(
+                    failed_index,
+                    run_pipeline(job, services, cancellation, events.clone()).await,
+                );
+                if let TaskEvent::BatchRetryFailed { error: message, .. } = &event {
+                    error!(error = %message, "batch retry pipeline failed");
+                }
+                let _ = events.send(event);
             });
             true
         }
@@ -247,6 +300,17 @@ impl Write for LogWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declined_retry_overwrite_is_recorded_as_skipped() {
+        assert!(matches!(
+            batch_retry_event(
+                2,
+                Err(AppError::OutputExists(PathBuf::from("episode.zh-CN.srt"))),
+            ),
+            TaskEvent::BatchRetrySkipped { failed_index: 2 }
+        ));
+    }
 
     #[test]
     fn accepts_at_most_one_startup_path() {

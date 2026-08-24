@@ -15,7 +15,7 @@ use crate::{
 use super::{
     TranslationRequest, TranslationResponse,
     openai::{endpoint, parse_translation_json},
-    prompt::{system_prompt, user_payload},
+    prompt::{correction_prompt, system_prompt, user_payload},
     provider::Translator,
     sse::{SseEvent, read_response},
     structured_output::{rejects_structured_output_field, translation_schema},
@@ -66,21 +66,19 @@ impl AnthropicCompatibleTranslator {
             () = cancellation.cancelled() => Err(AppError::Cancelled),
         }
     }
-}
 
-#[async_trait]
-impl Translator for AnthropicCompatibleTranslator {
-    async fn translate(
+    async fn translate_with_system(
         &self,
         request: TranslationRequest,
         cancellation: &CancellationToken,
+        system: String,
     ) -> Result<TranslationResponse> {
         let input = user_payload(&request)?;
         let mut payload = AnthropicRequest {
             model: &self.model,
             max_tokens: 4_096,
             stream: true,
-            system: system_prompt(&request),
+            system,
             messages: vec![AnthropicMessage {
                 role: "user",
                 content: input,
@@ -119,6 +117,29 @@ impl Translator for AnthropicCompatibleTranslator {
         let translated = parse_translation_json(&content)?;
         translated.validate_for(&request)?;
         Ok(translated)
+    }
+}
+
+#[async_trait]
+impl Translator for AnthropicCompatibleTranslator {
+    async fn translate(
+        &self,
+        request: TranslationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<TranslationResponse> {
+        let system = system_prompt(&request);
+        self.translate_with_system(request, cancellation, system)
+            .await
+    }
+
+    async fn translate_correction(
+        &self,
+        request: TranslationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<TranslationResponse> {
+        let system = correction_prompt(&request);
+        self.translate_with_system(request, cancellation, system)
+            .await
     }
 }
 

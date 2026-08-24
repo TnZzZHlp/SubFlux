@@ -157,7 +157,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            document.render().unwrap(),
+            document
+                .render_with_mode(crate::subtitle::SubtitleOutputMode::Translated)
+                .unwrap(),
             "1\n00:00:01,200 --> 00:00:04,700\n译: こんにちは\n"
         );
     }

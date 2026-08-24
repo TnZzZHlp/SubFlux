@@ -4,13 +4,13 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{AppError, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SseEvent {
+pub struct SseEvent {
     pub event: Option<String>,
     pub data: String,
 }
 
 #[derive(Default)]
-pub(crate) struct SseDecoder {
+pub struct SseDecoder {
     buffer: Vec<u8>,
     event: Option<String>,
     data: Vec<String>,
@@ -64,7 +64,7 @@ impl SseDecoder {
     }
 }
 
-pub(crate) async fn read_response(
+pub async fn read_response(
     mut response: Response,
     cancellation: &CancellationToken,
 ) -> Result<Vec<SseEvent>> {
@@ -98,11 +98,11 @@ mod tests {
     #[test]
     fn decodes_events_split_across_chunks() {
         let mut decoder = SseDecoder::default();
-        assert!(
+        assert_eq!(
             decoder
                 .push(b"event: content_block_delta\ndata: {\"text\":")
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [crate::translator::sse::SseEvent; 0]
         );
         let mut events = decoder.push(b"\"ok\"}\n\n").unwrap();
         events.extend(decoder.finish().unwrap());

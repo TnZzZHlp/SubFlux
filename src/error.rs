@@ -86,18 +86,11 @@ impl AppError {
     }
 }
 
-/// Builds a safe, user-visible API error without discarding the provider's
-/// response body. Gateways often put the useful diagnostic detail alongside
-/// `error.message`, so reducing a response to that one field hides the cause.
-pub(crate) fn api_response_error(status: u16, response_body: &[u8], secret: &str) -> AppError {
-    let response_body = String::from_utf8_lossy(response_body);
-    let message = if response_body.trim().is_empty() {
-        format!("API 请求失败（HTTP {status}）：服务器未返回错误详情。")
-    } else {
-        format!("API 请求失败（HTTP {status}）：\n{response_body}")
-    };
+/// Builds a safe, user-visible API error. Provider bodies are deliberately
+/// excluded because gateways may echo credentials or subtitle request data.
+pub(crate) fn api_response_error(status: u16, _response_body: &[u8], _secret: &str) -> AppError {
     AppError::ApiError {
-        message: redact_secret(message, secret),
+        message: format!("API 请求失败（HTTP {status}）；请检查服务端日志或稍后重试。"),
     }
 }
 
@@ -124,18 +117,13 @@ mod tests {
     }
 
     #[test]
-    fn preserves_full_api_response_body_and_redacts_credentials() {
-        let detail = "x".repeat(600);
-        let body = format!(
-            r#"{{"error":{{"message":"Forbidden","detail":"{detail}","key":"sk-secret"}}}}"#
-        );
+    fn api_errors_do_not_expose_provider_response_bodies() {
+        let body = r#"{"error":{"message":"subtitle body","key":"sk-secret"}}"#;
 
         let message = api_response_error(403, body.as_bytes(), "sk-secret").safe_message();
 
         assert!(message.contains("HTTP 403"));
-        assert!(message.contains("Forbidden"));
-        assert!(message.contains(&detail));
-        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains("subtitle body"));
         assert!(!message.contains("sk-secret"));
     }
 }

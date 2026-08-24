@@ -18,6 +18,16 @@ pub fn spawn_input(sender: UnboundedSender<Action>) {
                             break;
                         }
                     }
+                    Ok(Event::Paste(text)) => {
+                        if sender.send(Action::Paste(text)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Event::Resize(_, _)) => {
+                        if sender.send(Action::Tick).is_err() {
+                            break;
+                        }
+                    }
                     Ok(_) => {}
                     Err(_) => break,
                 },

@@ -161,16 +161,22 @@ subtitle-translator /media/movie.mkv
 subtitle-translator /media/series
 ```
 
-On Home, type paths into the selected Video or External subtitle field. The
-tool deliberately uses text paths rather than a platform-specific file picker,
-so it works over SSH and in ordinary terminals.
+Home presents an explicit **Single file / Batch** mode followed by Input,
+Subtitle, Language, and Output sections. Press `Enter` on a path field to enter
+editing mode, then type or paste the path. Editing supports `Left`/`Right`,
+`Home`/`End`, `Backspace`, and `Delete`; press `Enter` or `Esc` to return to
+navigation. The tool deliberately uses text paths rather than a
+platform-specific file picker, so it works over SSH and in ordinary terminals.
+
+The complete layout is designed for terminals of at least `80x24`. Smaller
+terminals use a compact status view that keeps cancellation and overwrite
+choices available.
 
 The startup argument accepts either one video file or one directory. Directory
 discovery recognizes common video extensions, sorts matches deterministically,
-and never follows directory symlinks. On the video-selection page, `B` runs
-all discovered videos in that order; `Enter` still selects one video for the
-existing single-video workflow. You can return to Home to adjust languages or
-output type before pressing `B`.
+and never follows directory symlinks. Multiple discovered videos open Home in
+Batch mode. Press `V` to inspect the video list, `Enter` there to choose one for
+the single-file workflow, or `B` to process all discovered videos in order.
 
 Batch processing supports **Auto** (each video chooses its own SDH-preferred
 text track, then its default text track, and falls back to STT) and explicit
@@ -185,16 +191,25 @@ or `Esc` cancels the batch and its running videos.
 
 | Key | Action |
 | --- | --- |
-| `Tab`, `↑`, `↓` | Move between Home fields |
-| `←`, `→`, `Enter` | Cycle source, languages, or output type; activate the selected field |
+| `Tab`, `Shift+Tab`, `↑`, `↓` | Move between visible Home fields |
+| `←`, `→`, `Enter` | Change the selected option or activate the selected field |
+| `Enter` on a path | Start or finish editing; `Esc` also finishes editing |
+| `←`, `→`, `Home`, `End`, `Backspace`, `Delete` while editing | Edit the path at the cursor |
+| `V` | Open the discovered-video list |
 | `B` | Process every video discovered from a startup directory |
-| `P` | Probe video subtitle tracks |
+| `P` | Probe video subtitle tracks without leaving the current setup page on failure |
 | `T` | Open Subtitle Track Selection |
 | `A` / `X` on track page | Choose Auto / STT |
 | `S` | Open Settings; `R` reloads `.env` |
+| `↑`, `↓`, `Home`, `End`, `PageUp`, `PageDown` | Navigate long video and track lists |
 | `↑`, `↓`, `PageUp`, `PageDown` during a batch | Scroll active-file progress bars |
+| `↑` / `↓` on a batch result | Select a failed video |
+| `PageUp` / `PageDown` on a batch result | Scroll the selected failure details |
+| `R` on a batch result | Rerun the selected failure with the original batch settings and a separate overwrite prompt |
 | `C` or `Esc` while processing | Cancel the background task |
 | `Q` | Quit |
+
+Letter shortcuts are case-insensitive outside path editing mode.
 
 Image tracks such as PGS, VobSub/DVD subtitles, DVB subtitles, and XSUB are
 shown but never sent to the text pipeline. Select STT instead.
@@ -216,12 +231,13 @@ Existing subtitles preserve their format:
   -> /movie/movie.zh-CN.ass
 ```
 
-Home offers three output types. **Translated only** is the default.
-**Bilingual** puts the original line before its translation. **Original only**
-writes the extracted subtitle unchanged (or the STT transcript) and does not
-need a translator API key. STT still requires its own API key. All three use
-the same existing `<name>.<target-language>.<extension>` output name, so select
-the desired type before starting the task.
+Home offers four output types. **Bilingual (translation first)** is the default.
+**Bilingual (original first)** puts the original line before its translation.
+**Translated only** writes only the translation, and **Original only** writes the
+extracted subtitle unchanged (or the STT transcript) without needing a
+translator API key. STT still requires its own API key. All four use the same
+existing `<name>.<target-language>.<extension>` output name, so select the
+desired type before starting the task.
 
 STT produces SRT by default. A standalone subtitle such as `movie.ja.ass`
 becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs always prompt for confirmation; `Y`/`Enter` overwrites and

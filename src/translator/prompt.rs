@@ -8,16 +8,33 @@ use crate::{
 use super::TranslationRequest;
 
 pub fn system_prompt(request: &TranslationRequest) -> String {
+    instruction(request, "")
+}
+
+pub fn correction_prompt(request: &TranslationRequest) -> String {
+    instruction(request, "A prior response was invalid. ")
+}
+
+fn instruction(request: &TranslationRequest, prefix: &str) -> String {
+    let ids = request
+        .segments
+        .iter()
+        .map(|segment| segment.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "Translate subtitle text from {} to {}. The user message is a JSON object with \
+        "{prefix}Translate subtitle text from {} to {}. The user message is a JSON object with \
          previous_context, segments, and next_context. previous_context and next_context are \
          read-only context to help comprehension: never translate or return either context list. \
          Translate only segments. Return JSON only, with exactly this object shape: \
-         {{\"translations\":[{{\"id\":123,\"text\":\"translated text\"}}]}}. The result count and order must exactly \
-         match segments. Preserve every segments id exactly once; do not add, remove, modify, \
-         merge, or split entries. Do not return explanations or Markdown. Translate only text; \
-         formatting tags are intentionally absent from the input and must not be invented.",
-        request.source_language, request.target_language
+         {{\"translations\":[{{\"id\":123,\"text\":\"translated text\"}}]}}. Return exactly {} translations \
+         in this order with IDs [{ids}]. Preserve every segments id exactly once; do not add, \
+         remove, modify, merge, or split entries. Do not return explanations or Markdown. \
+         Translate only text; formatting tags are intentionally absent from the input and must not \
+         be invented.",
+        request.source_language,
+        request.target_language,
+        request.segments.len(),
     )
 }
 
@@ -59,12 +76,18 @@ mod tests {
                 id: 100,
                 text: "before".into(),
             }],
-            segments: vec![TranslationItem {
-                id: 101,
-                text: "translate".into(),
-            }],
+            segments: vec![
+                TranslationItem {
+                    id: 101,
+                    text: "translate".into(),
+                },
+                TranslationItem {
+                    id: 102,
+                    text: "also translate".into(),
+                },
+            ],
             next_context: vec![TranslationItem {
-                id: 102,
+                id: 103,
                 text: "after".into(),
             }],
         }
@@ -77,7 +100,7 @@ mod tests {
         assert_eq!(payload["target_language"], "zh-CN");
         assert_eq!(payload["previous_context"][0]["id"], 100);
         assert_eq!(payload["segments"][0]["id"], 101);
-        assert_eq!(payload["next_context"][0]["id"], 102);
+        assert_eq!(payload["next_context"][0]["id"], 103);
         assert!(payload["segments"][0].get("start_ms").is_none());
         assert!(payload["segments"][0].get("end_ms").is_none());
     }
@@ -86,7 +109,17 @@ mod tests {
     fn system_prompt_limits_translation_to_segments() {
         let prompt = system_prompt(&request());
         assert!(prompt.contains("Translate only segments"));
+        assert!(prompt.contains("exactly 2 translations in this order with IDs [101, 102]"));
         assert!(prompt.contains("never translate or return either context list"));
         assert!(prompt.contains(r#"{"translations":[{"id":123,"text":"translated text"}]}"#));
+    }
+
+    #[test]
+    fn correction_prompt_repeats_expected_ids_without_response_content() {
+        let prompt = correction_prompt(&request());
+        assert!(prompt.contains("A prior response was invalid"));
+        assert!(prompt.contains("exactly 2 translations in this order with IDs [101, 102]"));
+        assert!(!prompt.contains("before"));
+        assert!(!prompt.contains("translate\""));
     }
 }

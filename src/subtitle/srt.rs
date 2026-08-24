@@ -144,7 +144,9 @@ mod tests {
             .apply_translation(SubtitleId(1), "你好".into())
             .unwrap();
         assert_eq!(
-            document.render().unwrap(),
+            document
+                .render_with_mode(crate::subtitle::SubtitleOutputMode::Translated)
+                .unwrap(),
             "1\r\n00:00:01,250 --> 00:00:03,000\r\n<i>你好</i>\r\n\r\n"
         );
     }

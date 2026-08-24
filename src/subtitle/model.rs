@@ -82,11 +82,13 @@ impl fmt::Display for SubtitleFormat {
 /// source transcript without constructing or calling a translation provider.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SubtitleOutputMode {
-    /// Write only the translated text. This is the historical default.
+    /// Write the translated text followed by the original text.
     #[default]
-    Translated,
+    BilingualTranslationFirst,
     /// Write the original text followed by the translated text.
     Bilingual,
+    /// Write only the translated text.
+    Translated,
     /// Write only the original text.
     Original,
 }
@@ -156,16 +158,36 @@ impl RawSubtitleEntry {
         }
     }
 
-    fn render_bilingual(&self, original: &str, translated: &str, line_break: &str) -> String {
+    fn render_bilingual(
+        &self,
+        original: &str,
+        translated: &str,
+        line_break: &str,
+        translation_first: bool,
+    ) -> String {
+        let translated = self.render_translation(translated);
         match self {
             Self::Srt { .. } | Self::Vtt { .. } => {
-                format!(
-                    "{original}{line_break}{}",
-                    self.render_translation(translated)
-                )
+                if translation_first {
+                    format!("{translated}{line_break}{original}")
+                } else {
+                    format!("{original}{line_break}{translated}")
+                }
             }
-            Self::Ass { .. } => format!("{original}\\N{}", self.render_translation(translated)),
-            Self::Generated => format!("{original}\n{translated}"),
+            Self::Ass { .. } => {
+                if translation_first {
+                    format!("{translated}\\N{original}")
+                } else {
+                    format!("{original}\\N{translated}")
+                }
+            }
+            Self::Generated => {
+                if translation_first {
+                    format!("{translated}\n{original}")
+                } else {
+                    format!("{original}\n{translated}")
+                }
+            }
         }
     }
 }
@@ -237,7 +259,7 @@ impl SubtitleDocument {
     }
 
     pub fn render(&self) -> Result<String> {
-        self.render_with_mode(SubtitleOutputMode::Translated)
+        self.render_with_mode(SubtitleOutputMode::default())
     }
 
     pub fn render_with_mode(&self, output_mode: SubtitleOutputMode) -> Result<String> {
@@ -272,11 +294,14 @@ impl SubtitleDocument {
             }
             let replacement = match output_mode {
                 SubtitleOutputMode::Translated => entry.raw.render_translation(translation),
-                SubtitleOutputMode::Bilingual => {
+                SubtitleOutputMode::BilingualTranslationFirst | SubtitleOutputMode::Bilingual => {
                     let original = &self.original.content[range.start..range.end];
-                    entry
-                        .raw
-                        .render_bilingual(original, translation, line_break)
+                    entry.raw.render_bilingual(
+                        original,
+                        translation,
+                        line_break,
+                        output_mode == SubtitleOutputMode::BilingualTranslationFirst,
+                    )
                 }
                 SubtitleOutputMode::Original => unreachable!("handled before replacements"),
             };
@@ -338,6 +363,13 @@ fn render_generated_srt(entries: &[SubtitleEntry], output_mode: SubtitleOutputMo
                     .as_deref()
                     .unwrap_or(&entry.translatable_text),
             ),
+            SubtitleOutputMode::BilingualTranslationFirst => {
+                if let Some(translation) = &entry.translated_text {
+                    result.push_str(translation);
+                    result.push('\n');
+                }
+                result.push_str(&entry.translatable_text);
+            }
             SubtitleOutputMode::Bilingual => {
                 result.push_str(&entry.translatable_text);
                 if let Some(translation) = &entry.translated_text {
@@ -372,10 +404,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(
+            document.render().unwrap(),
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\nhello\n"
+        );
+        assert_eq!(
             document
                 .render_with_mode(SubtitleOutputMode::Translated)
                 .unwrap(),
             "1\n00:00:00,000 --> 00:00:01,000\n你好\n"
+        );
+        assert_eq!(
+            document
+                .render_with_mode(SubtitleOutputMode::BilingualTranslationFirst)
+                .unwrap(),
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\nhello\n"
         );
         assert_eq!(
             document
@@ -407,6 +449,11 @@ mod tests {
             .render_with_mode(SubtitleOutputMode::Bilingual)
             .unwrap();
         assert!(rendered.contains("{\\an8}hello\\N{\\an8}你好"));
+
+        let rendered = document
+            .render_with_mode(SubtitleOutputMode::BilingualTranslationFirst)
+            .unwrap();
+        assert!(rendered.contains("{\\an8}你好\\N{\\an8}hello"));
     }
 
     #[test]
@@ -422,6 +469,64 @@ mod tests {
                 .render_with_mode(SubtitleOutputMode::Bilingual)
                 .unwrap(),
             "1\r\n00:00:01,000 --> 00:00:02,000\r\nhello\r\n你好\r\n\r\n"
+        );
+        assert_eq!(
+            document
+                .render_with_mode(SubtitleOutputMode::BilingualTranslationFirst)
+                .unwrap(),
+            "1\r\n00:00:01,000 --> 00:00:02,000\r\n你好\r\nhello\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn bilingual_vtt_preserves_markup_in_both_lines() {
+        let source = "WEBVTT\n\n00:01.000 --> 00:03.000\n<c.red>Hello</c>\n";
+        let mut document = crate::subtitle::parse(SubtitleFormat::Vtt, source).unwrap();
+        document
+            .apply_translation(SubtitleId(1), "你好".into())
+            .unwrap();
+
+        let rendered = document
+            .render_with_mode(SubtitleOutputMode::BilingualTranslationFirst)
+            .unwrap();
+        assert!(rendered.contains("<c.red>你好</c>\n<c.red>Hello</c>"));
+    }
+
+    #[test]
+    fn bilingual_ssa_uses_the_ass_line_break() {
+        let source = concat!(
+            "[Events]\n",
+            "Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+            "Dialogue: Marked=0,0:00:01.00,0:00:02.00,Default,,0000,0000,0000,,hello\n"
+        );
+        let mut document = crate::subtitle::parse(SubtitleFormat::Ssa, source).unwrap();
+        document
+            .apply_translation(SubtitleId(1), "你好".into())
+            .unwrap();
+
+        let rendered = document
+            .render_with_mode(SubtitleOutputMode::BilingualTranslationFirst)
+            .unwrap();
+        assert!(rendered.contains("你好\\Nhello"));
+    }
+
+    #[test]
+    fn bilingual_translation_first_falls_back_to_source_without_translation() {
+        let document = SubtitleDocument::from_speech_segments(
+            vec![SpeechSegment {
+                start_ms: 0,
+                end_ms: 1_000,
+                text: "hello".into(),
+            }],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            document
+                .render_with_mode(SubtitleOutputMode::BilingualTranslationFirst)
+                .unwrap(),
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n"
         );
     }
 

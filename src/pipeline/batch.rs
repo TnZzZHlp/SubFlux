@@ -41,7 +41,7 @@ pub struct BatchJob {
 }
 
 impl BatchJob {
-    fn pipeline_job(&self, video: PathBuf) -> PipelineJob {
+    pub(crate) fn pipeline_job(&self, video: PathBuf) -> PipelineJob {
         PipelineJob {
             video: Some(video),
             input: match self.subtitle_input {
@@ -56,9 +56,10 @@ impl BatchJob {
     }
 }
 
-/// Runs independent videos with the configured concurrency. A per-video
-/// failure is recorded and does not stop other videos; cancellation stops new
-/// videos and cancels the running pipelines through the shared token.
+/// Runs independent videos with the configured concurrency.
+///
+/// A per-video failure is recorded without stopping other videos. Cancellation
+/// stops new videos and cancels running pipelines through the shared token.
 pub async fn run_batch(
     job: BatchJob,
     services: Arc<Services>,
@@ -411,7 +412,7 @@ mod tests {
 
         assert_eq!(summary.succeeded, vec![PathBuf::from("fresh.zh-CN.srt")]);
         assert_eq!(summary.skipped, vec![PathBuf::from("existing.mkv")]);
-        assert!(summary.failed.is_empty());
+        assert_eq!(summary.failed, Vec::new());
         assert!(
             std::iter::from_fn(|| received_events.try_recv().ok()).any(|event| matches!(
                 event,

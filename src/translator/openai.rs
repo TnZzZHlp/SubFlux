@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     TranslationRequest, TranslationResponse,
-    prompt::{system_prompt, user_payload},
+    prompt::{correction_prompt, system_prompt, user_payload},
     provider::Translator,
     sse::{SseEvent, read_response},
     structured_output::{openai_translation_schema, rejects_structured_output_field},
@@ -63,23 +63,21 @@ impl OpenAiCompatibleTranslator {
             () = cancellation.cancelled() => Err(AppError::Cancelled),
         }
     }
-}
 
-#[async_trait]
-impl Translator for OpenAiCompatibleTranslator {
-    async fn translate(
+    async fn translate_with_system(
         &self,
         request: TranslationRequest,
         cancellation: &CancellationToken,
+        system: String,
     ) -> Result<TranslationResponse> {
         let mut payload = OpenAiRequest {
             model: &self.model,
-            temperature: 0.2,
+            temperature: None,
             stream: true,
             messages: vec![
                 Message {
                     role: "system",
-                    content: system_prompt(&request),
+                    content: system,
                 },
                 Message {
                     role: "user",
@@ -123,10 +121,33 @@ impl Translator for OpenAiCompatibleTranslator {
     }
 }
 
+#[async_trait]
+impl Translator for OpenAiCompatibleTranslator {
+    async fn translate(
+        &self,
+        request: TranslationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<TranslationResponse> {
+        let system = system_prompt(&request);
+        self.translate_with_system(request, cancellation, system)
+            .await
+    }
+
+    async fn translate_correction(
+        &self,
+        request: TranslationRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<TranslationResponse> {
+        let system = correction_prompt(&request);
+        self.translate_with_system(request, cancellation, system)
+            .await
+    }
+}
+
 #[derive(Serialize)]
 struct OpenAiRequest<'a> {
     model: &'a str,
-    temperature: f32,
+    temperature: Option<f32>,
     stream: bool,
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -386,7 +407,7 @@ mod tests {
         };
         let payload = OpenAiRequest {
             model: "model",
-            temperature: 0.2,
+            temperature: Some(0.2),
             stream: true,
             messages: Vec::new(),
             response_format: Some(response_format(&request)),
@@ -409,7 +430,7 @@ mod tests {
     fn omits_response_format_for_fallback_requests() {
         let payload = OpenAiRequest {
             model: "model",
-            temperature: 0.2,
+            temperature: None,
             stream: true,
             messages: Vec::new(),
             response_format: None,

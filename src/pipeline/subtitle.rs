@@ -113,19 +113,27 @@ async fn translate_chunk_with_retry(
     cancellation: &CancellationToken,
 ) -> Result<crate::translator::TranslationResponse> {
     let mut last_error = None;
+    let mut correction = false;
     for attempt in 0..=max_retries {
         check_cancelled(cancellation)?;
-        let response = translator
-            .translate(request.clone(), cancellation)
-            .await
-            .and_then(|response| {
-                response.validate_for(request)?;
-                Ok(response)
-            });
+        let response = if correction {
+            translator
+                .translate_correction(request.clone(), cancellation)
+                .await
+        } else {
+            translator.translate(request.clone(), cancellation).await
+        }
+        .and_then(|response| {
+            response.validate_for(request)?;
+            Ok(response)
+        });
         match response {
             Ok(response) => return Ok(response),
             Err(AppError::Cancelled) => return Err(AppError::Cancelled),
             Err(error) => {
+                if let AppError::InvalidApiResponse(_) = &error {
+                    correction = true;
+                }
                 last_error = Some(error);
                 if attempt < max_retries {
                     warn!(
@@ -221,6 +229,46 @@ mod tests {
                     .map(|entry| TranslationItem {
                         id: entry.id,
                         text: format!("translated {}", entry.text),
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    struct CorrectiveTranslator {
+        normal_calls: AtomicUsize,
+        correction_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Translator for CorrectiveTranslator {
+        async fn translate(
+            &self,
+            request: TranslationRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<TranslationResponse> {
+            self.normal_calls.fetch_add(1, Ordering::SeqCst);
+            let mut entries = request.segments;
+            entries.push(TranslationItem {
+                id: 999,
+                text: "extra".into(),
+            });
+            Ok(TranslationResponse { entries })
+        }
+
+        async fn translate_correction(
+            &self,
+            request: TranslationRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<TranslationResponse> {
+            self.correction_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TranslationResponse {
+                entries: request
+                    .segments
+                    .into_iter()
+                    .map(|item| TranslationItem {
+                        id: item.id,
+                        text: format!("corrected {}", item.text),
                     })
                     .collect(),
             })
@@ -336,6 +384,62 @@ mod tests {
                 .enumerate()
                 .all(|(index, entry)| entry.translated_text.as_deref()
                     == Some(&format!("translated line {}", index + 1)))
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_response_entry_uses_correction_and_applies_only_valid_response() {
+        let mut document = SubtitleDocument::from_speech_segments(
+            vec![
+                SpeechSegment {
+                    start_ms: 0,
+                    end_ms: 1,
+                    text: "one".into(),
+                },
+                SpeechSegment {
+                    start_ms: 1,
+                    end_ms: 2,
+                    text: "two".into(),
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        let translator = CorrectiveTranslator {
+            normal_calls: AtomicUsize::new(0),
+            correction_calls: AtomicUsize::new(0),
+        };
+        let cancellation = CancellationToken::new();
+        let (events, _receiver) = unbounded_channel();
+        let source_language = LanguageCode::parse("en").unwrap();
+        let target_language = LanguageCode::parse("zh-CN").unwrap();
+
+        translate_document(
+            &mut document,
+            TranslationContext {
+                source_language: &source_language,
+                target_language: &target_language,
+                chunk_size: 2,
+                context_before: 0,
+                context_after: 0,
+                max_retries: 1,
+                translator: &translator,
+                cancellation: &cancellation,
+                events: &events,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(translator.normal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(translator.correction_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            document
+                .entries
+                .iter()
+                .map(|entry| entry.translated_text.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("corrected one"), Some("corrected two")]
         );
     }
 }

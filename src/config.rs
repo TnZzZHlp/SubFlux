@@ -181,9 +181,7 @@ impl Config {
             Ok(iterator) => {
                 let mut values = HashMap::new();
                 for item in iterator {
-                    let (name, value) = item.map_err(|error| {
-                        AppError::InvalidConfig(format!("could not load .env: {error}"))
-                    })?;
+                    let (name, value) = item.map_err(safe_dotenv_error)?;
                     // Match dotenvy's normal loading behavior: the first
                     // declaration wins when a key appears more than once.
                     values.entry(name).or_insert(value);
@@ -193,11 +191,7 @@ impl Config {
             Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 HashMap::new()
             }
-            Err(error) => {
-                return Err(AppError::InvalidConfig(format!(
-                    "could not load .env: {error}"
-                )));
-            }
+            Err(error) => return Err(safe_dotenv_error(error)),
         };
         Self::from_getter(|name| {
             env::var(name)
@@ -306,6 +300,14 @@ fn parse_usize(name: &str, value: &str) -> Result<usize> {
         .map_err(|_| AppError::InvalidConfig(format!("{name} must be an integer")))
 }
 
+fn safe_dotenv_error(error: dotenvy::Error) -> AppError {
+    let message = match error {
+        dotenvy::Error::Io(error) => format!("could not read .env: {}", error.kind()),
+        _ => "could not parse .env; check its syntax".into(),
+    };
+    AppError::InvalidConfig(message)
+}
+
 fn parse_positive_usize(name: &str, value: &str) -> Result<usize> {
     let parsed = parse_usize(name, value)?;
     if parsed == 0 {
@@ -342,6 +344,18 @@ mod tests {
     fn masks_secret_without_exposing_it() {
         assert_eq!(ApiKey::new("sk-12345678").masked(), "sk-1****5678");
         assert_eq!(ApiKey::new("").masked(), "<未配置>");
+    }
+
+    #[test]
+    fn malformed_dotenv_errors_do_not_expose_the_source_line() {
+        let error = safe_dotenv_error(dotenvy::Error::LineParse(
+            "SUBFLUX_TRANSLATOR_API_KEY=secret-value".into(),
+            32,
+        ));
+        let message = error.safe_message();
+
+        assert!(message.contains("could not parse .env"));
+        assert!(!message.contains("secret-value"));
     }
 
     #[test]
