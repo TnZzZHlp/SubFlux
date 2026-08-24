@@ -147,6 +147,7 @@ impl Translator for OpenAiCompatibleTranslator {
 #[derive(Serialize)]
 struct OpenAiRequest<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
     messages: Vec<Message>,

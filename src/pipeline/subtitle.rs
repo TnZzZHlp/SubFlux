@@ -7,12 +7,16 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use super::checkpoint::CheckpointStore;
+
 use crate::{
     config::LanguageCode,
     error::{AppError, Result},
-    event::TaskEvent,
+    event::{CheckpointPhase, TaskEvent},
     subtitle::{SubtitleDocument, SubtitleId},
-    translator::{TranslationChunkConfig, TranslationRequest, Translator, build_chunks},
+    translator::{
+        TranslationChunkConfig, TranslationRequest, TranslationResponse, Translator, build_chunks,
+    },
 };
 
 /// In-memory recovery state.
@@ -39,9 +43,63 @@ pub struct TranslationContext<'a> {
     pub events: &'a UnboundedSender<TaskEvent>,
 }
 
+pub(crate) fn checkpoint_translations_valid(
+    document: &SubtitleDocument,
+    source_language: &LanguageCode,
+    target_language: &LanguageCode,
+    chunk_size: usize,
+    context_before: usize,
+    context_after: usize,
+    checkpoint: &CheckpointStore,
+) -> Result<bool> {
+    let chunks = build_chunks(
+        document,
+        TranslationChunkConfig {
+            chunk_size,
+            context_before,
+            context_after,
+        },
+    )?;
+    if checkpoint.translation_len() > chunks.len() {
+        return Ok(false);
+    }
+    Ok(chunks
+        .iter()
+        .take(checkpoint.translation_len())
+        .all(|chunk| {
+            checkpoint
+                .translation_response(chunk.index)
+                .is_some_and(|response| {
+                    response
+                        .validate_for(&translation_request(
+                            chunk,
+                            source_language,
+                            target_language,
+                        ))
+                        .is_ok()
+                })
+        }))
+}
+
 pub async fn translate_document(
     document: &mut SubtitleDocument,
     context: TranslationContext<'_>,
+) -> Result<TranslationWorkState> {
+    translate_document_inner(document, context, None).await
+}
+
+pub(crate) async fn translate_document_with_checkpoint(
+    document: &mut SubtitleDocument,
+    context: TranslationContext<'_>,
+    checkpoint: &mut CheckpointStore,
+) -> Result<TranslationWorkState> {
+    translate_document_inner(document, context, Some(checkpoint)).await
+}
+
+async fn translate_document_inner(
+    document: &mut SubtitleDocument,
+    context: TranslationContext<'_>,
+    mut checkpoint: Option<&mut CheckpointStore>,
 ) -> Result<TranslationWorkState> {
     let chunks = build_chunks(
         document,
@@ -62,17 +120,41 @@ pub async fn translate_document(
         pending_chunks: chunks.iter().map(|chunk| chunk.index).collect(),
         ..TranslationWorkState::default()
     };
+    let resumed = checkpoint
+        .as_deref()
+        .map_or(0, CheckpointStore::translation_len);
+    if resumed > chunks.len() {
+        return Err(AppError::CheckpointError(
+            "checkpoint has too many translation chunks".into(),
+        ));
+    }
     let mut completed = 0;
 
-    for chunk in chunks {
+    for chunk in chunks.iter().take(resumed) {
+        let request = translation_request(chunk, context.source_language, context.target_language);
+        let response = checkpoint
+            .as_deref()
+            .and_then(|checkpoint| checkpoint.translation_response(chunk.index))
+            .ok_or_else(|| {
+                AppError::CheckpointError("checkpoint translation chunk is missing".into())
+            })?;
+        response.validate_for(&request)?;
+        apply_response(document, response)?;
+        completed += chunk.segments.len();
+        state.pending_chunks.remove(&chunk.index);
+        state.completed_chunks.insert(chunk.index);
+    }
+    if completed > 0 {
+        let _ = context.events.send(TaskEvent::CheckpointResumed {
+            phase: CheckpointPhase::Translation,
+            completed,
+            total,
+        });
+    }
+
+    for chunk in chunks.into_iter().skip(resumed) {
         check_cancelled(context.cancellation)?;
-        let request = TranslationRequest {
-            source_language: context.source_language.clone(),
-            target_language: context.target_language.clone(),
-            previous_context: chunk.previous_context.clone(),
-            segments: chunk.segments.clone(),
-            next_context: chunk.next_context.clone(),
-        };
+        let request = translation_request(&chunk, context.source_language, context.target_language);
         let response = translate_chunk_with_retry(
             &request,
             chunk.index,
@@ -83,9 +165,12 @@ pub async fn translate_document(
         .await;
         match response {
             Ok(response) => {
-                for item in response.entries {
-                    document.apply_translation(SubtitleId(item.id), item.text)?;
+                if let Some(checkpoint) = checkpoint.as_deref_mut() {
+                    checkpoint
+                        .record_translation(chunk.index, &response)
+                        .await?;
                 }
+                apply_response(document, response)?;
                 completed += chunk.segments.len();
                 state.pending_chunks.remove(&chunk.index);
                 state.completed_chunks.insert(chunk.index);
@@ -103,6 +188,27 @@ pub async fn translate_document(
         }
     }
     Ok(state)
+}
+
+fn translation_request(
+    chunk: &crate::translator::TranslationChunk,
+    source_language: &LanguageCode,
+    target_language: &LanguageCode,
+) -> TranslationRequest {
+    TranslationRequest {
+        source_language: source_language.clone(),
+        target_language: target_language.clone(),
+        previous_context: chunk.previous_context.clone(),
+        segments: chunk.segments.clone(),
+        next_context: chunk.next_context.clone(),
+    }
+}
+
+fn apply_response(document: &mut SubtitleDocument, response: TranslationResponse) -> Result<()> {
+    for item in response.entries {
+        document.apply_translation(SubtitleId(item.id), item.text)?;
+    }
+    Ok(())
 }
 
 async fn translate_chunk_with_retry(

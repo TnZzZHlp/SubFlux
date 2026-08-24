@@ -1,29 +1,35 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use tokio::sync::{
-    OnceCell,
+    Mutex, OnceCell, OwnedMutexGuard,
     mpsc::{UnboundedSender, unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     config::{Config, LanguageCode},
     error::{AppError, Result},
-    event::TaskEvent,
-    media::{TrackIndex, plan_audio_chunks, probe_duration, probe_media},
+    event::{CheckpointPhase, TaskEvent},
+    media::{SubtitleTrack, TrackIndex, plan_audio_chunks, probe_duration, probe_media},
     output::build_output_path,
     services::Services,
     stt::SttInput,
     subtitle::{
-        EmbeddedSubtitleSource, ExternalSubtitleSource, SubtitleDocument, SubtitleOutputMode,
-        SubtitleSource,
+        EmbeddedSubtitleSource, ExternalSubtitleSource, SubtitleDocument, SubtitleFormat,
+        SubtitleOutputMode, SubtitleSource,
     },
 };
 
 use super::{
+    checkpoint::{
+        CheckpointIdentity, CheckpointStore, SttCheckpointSettings, TranslatorCheckpointSettings,
+        fingerprint,
+    },
     stt::{ChunkedSttResults, document_from_stt_result},
-    subtitle::{TranslationContext, translate_document},
+    subtitle::{
+        TranslationContext, checkpoint_translations_valid, translate_document_with_checkpoint,
+    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +69,33 @@ impl PipelineJob {
 #[derive(Clone, Default)]
 pub(crate) struct BatchOverwrite {
     decision: Arc<OnceCell<bool>>,
+    output_locks: OutputLocks,
+}
+
+#[derive(Clone, Default)]
+struct OutputLocks {
+    locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+}
+
+impl OutputLocks {
+    async fn lock(
+        &self,
+        output: &std::path::Path,
+        cancellation: &CancellationToken,
+    ) -> Result<OwnedMutexGuard<()>> {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(output.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        tokio::select! {
+            guard = lock.lock_owned() => Ok(guard),
+            () = cancellation.cancelled() => Err(AppError::Cancelled),
+        }
+    }
 }
 
 impl BatchOverwrite {
@@ -77,6 +110,14 @@ impl BatchOverwrite {
             .get_or_try_init(|| confirm_batch_overwrite(output, events, cancellation))
             .await?;
         Ok(*decision)
+    }
+
+    async fn lock_output(
+        &self,
+        output: &std::path::Path,
+        cancellation: &CancellationToken,
+    ) -> Result<OwnedMutexGuard<()>> {
+        self.output_locks.lock(output, cancellation).await
     }
 }
 
@@ -107,41 +148,62 @@ async fn run_pipeline_inner(
     batch_overwrite: Option<&BatchOverwrite>,
 ) -> Result<PathBuf> {
     check_cancelled(&cancellation)?;
-    let mut document = load_document(&job, &services, &cancellation, &events).await?;
+    let resolved = resolve_input(&job, &events).await?;
     check_cancelled(&cancellation)?;
     let output = build_output_path(
         job.video.as_deref(),
         job.external_subtitle_path(),
         &job.target_language,
-        document.format,
+        resolved.format(),
     )?;
-    let overwrite = if output.exists() {
-        let approved = match batch_overwrite {
-            Some(batch_overwrite) => {
-                batch_overwrite
-                    .confirm(&output, &events, &cancellation)
-                    .await?
-            }
-            None => confirm_overwrite(&output, &events, &cancellation).await?,
-        };
-        if approved {
-            true
-        } else {
-            return Err(if batch_overwrite.is_some() {
-                AppError::Skipped(output)
-            } else {
-                AppError::OutputExists(output)
-            });
-        }
-    } else {
-        false
+    let _output_lock = match batch_overwrite {
+        Some(batch_overwrite) => Some(batch_overwrite.lock_output(&output, &cancellation).await?),
+        None => None,
     };
+    check_cancelled(&cancellation)?;
+    let overwrite = confirm_output(&output, &events, &cancellation, batch_overwrite).await?;
+
+    let identity = checkpoint_identity(&job, &resolved)?;
+    let mut checkpoint = CheckpointStore::load(&output, identity).await?;
+    let mut document = load_document(
+        &job,
+        &resolved,
+        &services,
+        &cancellation,
+        &events,
+        Some(&mut checkpoint),
+    )
+    .await?;
+    if job.output_mode.needs_translation()
+        && !checkpoint_translations_valid(
+            &document,
+            &job.source_language,
+            &job.target_language,
+            job.config.translator.chunk_size,
+            job.config.translator.context_before,
+            job.config.translator.context_after,
+            &checkpoint,
+        )?
+    {
+        checkpoint.clear().await?;
+        if resolved.is_stt() {
+            document = load_document(
+                &job,
+                &resolved,
+                &services,
+                &cancellation,
+                &events,
+                Some(&mut checkpoint),
+            )
+            .await?;
+        }
+    }
     if job.output_mode.needs_translation() {
         let translator = services
             .translator
             .as_deref()
             .ok_or(AppError::MissingConfiguration("SUBFLUX_TRANSLATOR_API_KEY"))?;
-        translate_document(
+        translate_document_with_checkpoint(
             &mut document,
             TranslationContext {
                 source_language: &job.source_language,
@@ -154,6 +216,7 @@ async fn run_pipeline_inner(
                 cancellation: &cancellation,
                 events: &events,
             },
+            &mut checkpoint,
         )
         .await?;
     }
@@ -163,8 +226,37 @@ async fn run_pipeline_inner(
         .subtitle_writer
         .write(&document, &output, job.output_mode, overwrite)
         .await?;
+    if let Err(error) = checkpoint.remove_after_success().await {
+        warn!(error = %error.safe_message(), "could not remove completed checkpoint");
+    }
     debug!(output = %output.display(), "subtitle output pipeline completed");
     Ok(output)
+}
+
+async fn confirm_output(
+    output: &std::path::Path,
+    events: &UnboundedSender<TaskEvent>,
+    cancellation: &CancellationToken,
+    batch_overwrite: Option<&BatchOverwrite>,
+) -> Result<bool> {
+    if !output.exists() {
+        return Ok(false);
+    }
+    let approved = match batch_overwrite {
+        Some(batch_overwrite) => {
+            batch_overwrite
+                .confirm(output, events, cancellation)
+                .await?
+        }
+        None => confirm_overwrite(output, events, cancellation).await?,
+    };
+    if approved {
+        Ok(true)
+    } else if batch_overwrite.is_some() {
+        Err(AppError::Skipped(output.to_path_buf()))
+    } else {
+        Err(AppError::OutputExists(output.to_path_buf()))
+    }
 }
 
 async fn confirm_overwrite(
@@ -210,52 +302,171 @@ async fn confirm_batch_overwrite(
     }
 }
 
-async fn load_document(
+#[derive(Clone, Debug)]
+enum ResolvedInput {
+    External {
+        path: PathBuf,
+        format: SubtitleFormat,
+    },
+    Embedded {
+        track: SubtitleTrack,
+        format: SubtitleFormat,
+    },
+    Stt,
+}
+
+impl ResolvedInput {
+    const fn format(&self) -> SubtitleFormat {
+        match self {
+            Self::External { format, .. } | Self::Embedded { format, .. } => *format,
+            Self::Stt => SubtitleFormat::Srt,
+        }
+    }
+
+    const fn is_stt(&self) -> bool {
+        matches!(self, Self::Stt)
+    }
+
+    const fn track_index(&self) -> Option<u32> {
+        match self {
+            Self::Embedded { track, .. } => Some(track.index.0),
+            Self::External { .. } | Self::Stt => None,
+        }
+    }
+
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::External { .. } => "external",
+            Self::Embedded { .. } => "embedded",
+            Self::Stt => "stt",
+        }
+    }
+}
+
+async fn resolve_input(
     job: &PipelineJob,
-    services: &Services,
-    cancellation: &CancellationToken,
     events: &UnboundedSender<TaskEvent>,
-) -> Result<SubtitleDocument> {
+) -> Result<ResolvedInput> {
     match &job.input {
         SubtitleInput::External(path) => {
-            send(events, TaskEvent::ExtractingSubtitle);
-            ExternalSubtitleSource::new(path).load().await
+            let format = SubtitleFormat::from_path(path).ok_or_else(|| {
+                AppError::UnsupportedSubtitleFormat(
+                    path.extension()
+                        .and_then(|extension| extension.to_str())
+                        .unwrap_or("<no extension>")
+                        .to_owned(),
+                )
+            })?;
+            Ok(ResolvedInput::External {
+                path: path.clone(),
+                format,
+            })
         }
-        SubtitleInput::Stt => load_stt_document(job, services, cancellation, events).await,
+        SubtitleInput::Stt => {
+            let _ = job.video_required()?;
+            Ok(ResolvedInput::Stt)
+        }
         SubtitleInput::Auto | SubtitleInput::Embedded(_) => {
             let video = job.video_required()?;
             send(events, TaskEvent::Probing);
             let probe = probe_media(video).await?;
             send(events, TaskEvent::TracksLoaded(probe.clone()));
-            let track = match job.input {
+            let track = match &job.input {
                 SubtitleInput::Auto => probe.auto_track().cloned(),
-                SubtitleInput::Embedded(index) => probe.track(index).cloned(),
+                SubtitleInput::Embedded(index) => probe.track(*index).cloned(),
                 SubtitleInput::External(_) | SubtitleInput::Stt => unreachable!(),
             };
             match track {
                 Some(track) if track.is_text() => {
-                    send(events, TaskEvent::ExtractingSubtitle);
-                    EmbeddedSubtitleSource::new(
-                        video,
-                        track,
-                        services.ffmpeg.clone(),
-                        cancellation.clone(),
-                    )
-                    .load()
-                    .await
+                    let format = track
+                        .format()
+                        .ok_or_else(|| AppError::UnsupportedSubtitleCodec(track.codec.clone()))?;
+                    Ok(ResolvedInput::Embedded { track, format })
                 }
                 Some(track) => Err(AppError::UnsupportedSubtitleCodec(format!(
                     "{}：当前字幕轨为图像字幕，不支持直接翻译。请选择 STT 模式。",
                     track.codec
                 ))),
-                None if matches!(job.input, SubtitleInput::Auto) => {
-                    // Auto's documented fallback: no usable text track means STT.
-                    load_stt_document(job, services, cancellation, events).await
-                }
+                None if matches!(&job.input, SubtitleInput::Auto) => Ok(ResolvedInput::Stt),
                 None => Err(AppError::ProbeFailed(
                     "selected subtitle track no longer exists in this video".into(),
                 )),
             }
+        }
+    }
+}
+
+fn checkpoint_identity(job: &PipelineJob, resolved: &ResolvedInput) -> Result<CheckpointIdentity> {
+    let mut inputs = Vec::new();
+    if let Some(video) = job.video.as_deref() {
+        inputs.push(fingerprint(video)?);
+    }
+    if let Some(external) = job.external_subtitle_path() {
+        inputs.push(fingerprint(external)?);
+    }
+    let requested_input = match &job.input {
+        SubtitleInput::Auto => "auto",
+        SubtitleInput::Embedded(_) => "embedded",
+        SubtitleInput::External(_) => "external",
+        SubtitleInput::Stt => "stt",
+    };
+    Ok(CheckpointIdentity {
+        inputs,
+        requested_input: requested_input.into(),
+        resolved_input: resolved.kind().into(),
+        track_index: resolved.track_index(),
+        format: resolved.format().extension().into(),
+        source_language: job.source_language.to_string(),
+        target_language: job.target_language.to_string(),
+        http_timeout_seconds: job.config.http_timeout.as_secs(),
+        stt: SttCheckpointSettings {
+            provider: job.config.stt.provider.clone(),
+            base_url: job.config.stt.base_url.clone(),
+            model: job.config.stt.model.clone(),
+            language: job.config.stt.language.to_string(),
+            chunk_seconds: job.config.stt.chunk_seconds,
+            chunk_overlap_seconds: job.config.stt.chunk_overlap_seconds,
+        },
+        translator: TranslatorCheckpointSettings {
+            provider: job.config.translator.provider.clone(),
+            api_format: format!("{:?}", job.config.translator.api_format),
+            base_url: job.config.translator.base_url.clone(),
+            model: job.config.translator.model.clone(),
+            chunk_size: job.config.translator.chunk_size,
+            context_before: job.config.translator.context_before,
+            context_after: job.config.translator.context_after,
+            max_retries: job.config.translator.max_retries,
+        },
+    })
+}
+
+async fn load_document(
+    job: &PipelineJob,
+    resolved: &ResolvedInput,
+    services: &Services,
+    cancellation: &CancellationToken,
+    events: &UnboundedSender<TaskEvent>,
+    checkpoint: Option<&mut CheckpointStore>,
+) -> Result<SubtitleDocument> {
+    match resolved {
+        ResolvedInput::External { path, .. } => {
+            send(events, TaskEvent::ExtractingSubtitle);
+            ExternalSubtitleSource::new(path).load().await
+        }
+        ResolvedInput::Embedded { track, .. } => {
+            let video = job.video_required()?;
+            send(events, TaskEvent::ExtractingSubtitle);
+            EmbeddedSubtitleSource::new(
+                video,
+                track.clone(),
+                services.ffmpeg.clone(),
+                cancellation.clone(),
+            )
+            .load()
+            .await
+        }
+        ResolvedInput::Stt => {
+            load_stt_document(job, services, cancellation, events, checkpoint).await
         }
     }
 }
@@ -265,6 +476,7 @@ async fn load_stt_document(
     services: &Services,
     cancellation: &CancellationToken,
     events: &UnboundedSender<TaskEvent>,
+    mut checkpoint: Option<&mut CheckpointStore>,
 ) -> Result<SubtitleDocument> {
     let video = job.video_required()?;
     send(events, TaskEvent::Probing);
@@ -279,6 +491,34 @@ async fn load_stt_document(
             "media has no audio duration available for speech recognition".into(),
         ));
     }
+    let saved_results = if let Some(store) = checkpoint.as_deref_mut() {
+        if store.stt_len() > chunks.len()
+            || (store.has_translations() && store.stt_len() != chunks.len())
+        {
+            store.clear().await?;
+            Vec::new()
+        } else {
+            store.stt_results()?
+        }
+    } else {
+        Vec::new()
+    };
+    let total = chunks.len();
+    let resumed = saved_results.len();
+    let mut results = ChunkedSttResults::default();
+    for (index, result) in saved_results.into_iter().enumerate() {
+        results.absorb(result, &chunks[index]);
+    }
+    if resumed > 0 {
+        send(
+            events,
+            TaskEvent::CheckpointResumed {
+                phase: CheckpointPhase::Stt,
+                completed: resumed,
+                total,
+            },
+        );
+    }
     let language = if job.source_language != LanguageCode::auto() {
         Some(job.source_language.clone())
     } else if job.config.stt.language != LanguageCode::auto() {
@@ -286,13 +526,7 @@ async fn load_stt_document(
     } else {
         None
     };
-    let stt = services
-        .stt
-        .as_ref()
-        .ok_or(AppError::MissingConfiguration("SUBFLUX_STT_API_KEY"))?;
-    let total = chunks.len();
-    let mut results = ChunkedSttResults::default();
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (index, chunk) in chunks.iter().enumerate().skip(resumed) {
         check_cancelled(cancellation)?;
         send(events, TaskEvent::ExtractingAudio);
         let audio = services
@@ -307,6 +541,10 @@ async fn load_stt_document(
                 total,
             },
         );
+        let stt = services
+            .stt
+            .as_ref()
+            .ok_or(AppError::MissingConfiguration("SUBFLUX_STT_API_KEY"))?;
         let result = stt
             .transcribe(
                 SttInput {
@@ -316,6 +554,9 @@ async fn load_stt_document(
                 cancellation,
             )
             .await?;
+        if let Some(store) = checkpoint.as_deref_mut() {
+            store.record_stt(index, &result).await?;
+        }
         results.absorb(result, chunk);
         send(
             events,
@@ -342,7 +583,14 @@ fn send(sender: &UnboundedSender<TaskEvent>, event: TaskEvent) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::Path, sync::Arc};
+    use std::{
+        collections::HashMap,
+        path::Path,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
     use tokio::process::Command;
@@ -406,6 +654,110 @@ mod tests {
                     .collect(),
             })
         }
+    }
+
+    struct FailsAfterOneTranslator {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Translator for FailsAfterOneTranslator {
+        async fn translate(
+            &self,
+            request: TranslationRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<TranslationResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(translated_response(request))
+            } else {
+                Err(AppError::TranslationError("intentional failure".into()))
+            }
+        }
+    }
+
+    struct RecordingTranslator {
+        requests: Mutex<Vec<Vec<u64>>>,
+    }
+
+    #[async_trait]
+    impl Translator for RecordingTranslator {
+        async fn translate(
+            &self,
+            request: TranslationRequest,
+            _cancellation: &CancellationToken,
+        ) -> Result<TranslationResponse> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.segments.iter().map(|entry| entry.id).collect());
+            Ok(translated_response(request))
+        }
+    }
+
+    struct FailsAfterOneStt {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SttProvider for FailsAfterOneStt {
+        async fn transcribe(
+            &self,
+            _input: SttInput,
+            _cancellation: &CancellationToken,
+        ) -> Result<SttResult> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(stt_result("first"))
+            } else {
+                Err(AppError::SttError("intentional failure".into()))
+            }
+        }
+    }
+
+    struct CountingStt {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SttProvider for CountingStt {
+        async fn transcribe(
+            &self,
+            _input: SttInput,
+            _cancellation: &CancellationToken,
+        ) -> Result<SttResult> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(stt_result(&format!("remaining {call}")))
+        }
+    }
+
+    fn translated_response(request: TranslationRequest) -> TranslationResponse {
+        TranslationResponse {
+            entries: request
+                .segments
+                .into_iter()
+                .map(|entry| TranslationItem {
+                    id: entry.id,
+                    text: format!("译文: {}", entry.text),
+                })
+                .collect(),
+        }
+    }
+
+    fn stt_result(text: &str) -> SttResult {
+        SttResult {
+            language: Some(LanguageCode::parse("ja").unwrap()),
+            segments: vec![SpeechSegment {
+                start_ms: 100,
+                end_ms: 900,
+                text: text.into(),
+            }],
+        }
+    }
+
+    fn checkpoint_file(directory: &Path) -> PathBuf {
+        let mut entries = std::fs::read_dir(directory.join(".subflux")).unwrap();
+        let checkpoint = entries.next().unwrap().unwrap().path();
+        assert!(entries.next().is_none());
+        checkpoint
     }
 
     #[tokio::test]
@@ -527,10 +879,6 @@ mod tests {
             events,
         ));
 
-        assert!(matches!(
-            received_events.recv().await,
-            Some(TaskEvent::ExtractingSubtitle)
-        ));
         let TaskEvent::OverwriteRequested {
             output: requested,
             response,
@@ -540,6 +888,10 @@ mod tests {
         };
         assert_eq!(requested, output);
         response.send(true).unwrap();
+        assert!(matches!(
+            received_events.recv().await,
+            Some(TaskEvent::ExtractingSubtitle)
+        ));
 
         assert_eq!(task.await.unwrap().unwrap(), output);
         assert_eq!(
@@ -579,10 +931,6 @@ mod tests {
             BatchOverwrite::default(),
         ));
 
-        assert!(matches!(
-            received_events.recv().await,
-            Some(TaskEvent::ExtractingSubtitle)
-        ));
         let TaskEvent::BatchOverwriteRequested { response, .. } =
             received_events.recv().await.unwrap()
         else {
@@ -598,6 +946,101 @@ mod tests {
             tokio::fs::read_to_string(output).await.unwrap(),
             "old output"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_serializes_jobs_with_the_same_output_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_source = directory.path().join("episode.en.srt");
+        let second_source = directory.path().join("episode.ja.srt");
+        let output = directory.path().join("episode.zh-CN.srt");
+        for source in [&first_source, &second_source] {
+            tokio::fs::write(source, "1\n00:00:00,000 --> 00:00:01,000\nsource\n")
+                .await
+                .unwrap();
+        }
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let first_job = PipelineJob {
+            video: None,
+            input: SubtitleInput::External(first_source),
+            source_language: LanguageCode::parse("en").unwrap(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Original,
+            config: config.clone(),
+        };
+        let second_job = PipelineJob {
+            video: None,
+            input: SubtitleInput::External(second_source),
+            source_language: LanguageCode::parse("ja").unwrap(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Original,
+            config,
+        };
+        let services = Arc::new(Services {
+            translator: None,
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let overwrite = BatchOverwrite::default();
+        let cancellation = CancellationToken::new();
+        let (events, mut received_events) = unbounded_channel();
+        let first = {
+            let services = Arc::clone(&services);
+            let events = events.clone();
+            let overwrite = overwrite.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                run_pipeline_with_batch_overwrite(
+                    first_job,
+                    services,
+                    cancellation,
+                    events,
+                    overwrite,
+                )
+                .await
+            })
+        };
+        let second = {
+            let services = Arc::clone(&services);
+            let events = events.clone();
+            let overwrite = overwrite.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                run_pipeline_with_batch_overwrite(
+                    second_job,
+                    services,
+                    cancellation,
+                    events,
+                    overwrite,
+                )
+                .await
+            })
+        };
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match received_events.recv().await {
+                    Some(TaskEvent::BatchOverwriteRequested { response, .. }) => break response,
+                    Some(_) => {}
+                    None => panic!("expected a shared overwrite prompt"),
+                }
+            }
+        })
+        .await
+        .expect("expected the duplicate output to wait for confirmation");
+        response.send(false).unwrap();
+
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AppError::Skipped(_))))
+                .count(),
+            1
+        );
+        assert!(output.exists());
     }
 
     #[tokio::test]
@@ -634,6 +1077,215 @@ mod tests {
         assert!(first.await.unwrap().unwrap());
         assert!(second.await.unwrap().unwrap());
         assert!(received_events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_existing_stt_output_skips_before_probing() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("movie.mkv");
+        let output = directory.path().join("movie.zh-CN.srt");
+        tokio::fs::write(&video, []).await.unwrap();
+        tokio::fs::write(&output, "completed").await.unwrap();
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let services = Arc::new(Services::from_config(&config, true).unwrap());
+        let (events, mut received_events) = unbounded_channel();
+        let task = tokio::spawn(run_pipeline(
+            PipelineJob {
+                video: Some(video),
+                input: SubtitleInput::Stt,
+                source_language: LanguageCode::auto(),
+                target_language: LanguageCode::parse("zh-CN").unwrap(),
+                output_mode: SubtitleOutputMode::Translated,
+                config,
+            },
+            services,
+            CancellationToken::new(),
+            events,
+        ));
+
+        let TaskEvent::OverwriteRequested { response, .. } = received_events.recv().await.unwrap()
+        else {
+            panic!("expected overwrite prompt before STT probing");
+        };
+        response.send(false).unwrap();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(AppError::OutputExists(path)) if path == output
+        ));
+        assert!(received_events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn translation_resume_skips_persisted_chunks_and_cleans_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("movie.ja.srt");
+        tokio::fs::write(
+            &source,
+            concat!(
+                "1\n00:00:00,000 --> 00:00:00,500\none\n\n",
+                "2\n00:00:01,000 --> 00:00:01,500\ntwo\n\n",
+                "3\n00:00:02,000 --> 00:00:02,500\nthree\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let config = Config::from_map(&HashMap::from([
+            ("SUBFLUX_TRANSLATOR_CHUNK_SIZE".into(), "1".into()),
+            ("SUBFLUX_TRANSLATOR_MAX_RETRIES".into(), "0".into()),
+        ]))
+        .unwrap();
+        let job = PipelineJob {
+            video: None,
+            input: SubtitleInput::External(source),
+            source_language: LanguageCode::parse("en").unwrap(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
+            config,
+        };
+        let failing = Arc::new(FailsAfterOneTranslator {
+            calls: AtomicUsize::new(0),
+        });
+        let first_services = Arc::new(Services {
+            translator: Some(failing),
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, _received_events) = unbounded_channel();
+        assert!(matches!(
+            run_pipeline(
+                job.clone(),
+                first_services,
+                CancellationToken::new(),
+                events,
+            )
+            .await,
+            Err(AppError::TranslationError(_))
+        ));
+        let checkpoint = checkpoint_file(directory.path());
+        assert!(checkpoint.exists());
+
+        let translator = Arc::new(RecordingTranslator {
+            requests: Mutex::new(Vec::new()),
+        });
+        let services = Arc::new(Services {
+            translator: Some(Arc::clone(&translator) as Arc<dyn Translator>),
+            stt: None,
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, mut received_events) = unbounded_channel();
+        let output = run_pipeline(job, services, CancellationToken::new(), events)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            translator.requests.lock().unwrap().as_slice(),
+            &[vec![2], vec![3]]
+        );
+        let events: Vec<_> = std::iter::from_fn(|| received_events.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TaskEvent::CheckpointResumed {
+                phase: CheckpointPhase::Translation,
+                completed: 1,
+                total: 3,
+            }
+        )));
+        assert_eq!(output, directory.path().join("movie.zh-CN.srt"));
+        assert!(!checkpoint.exists());
+    }
+
+    #[tokio::test]
+    async fn stt_resume_skips_persisted_audio_chunks() {
+        if !check_tools().is_ready() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("audio.mkv");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=2",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&video)
+            .output()
+            .await
+            .unwrap();
+        assert!(generated.status.success());
+        let config = Config::from_map(&HashMap::from([
+            ("SUBFLUX_STT_CHUNK_SECONDS".into(), "1".into()),
+            ("SUBFLUX_STT_CHUNK_OVERLAP_SECONDS".into(), "0".into()),
+        ]))
+        .unwrap();
+        let job = PipelineJob {
+            video: Some(video),
+            input: SubtitleInput::Stt,
+            source_language: LanguageCode::auto(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Original,
+            config,
+        };
+        let first_services = Arc::new(Services {
+            translator: None,
+            stt: Some(Arc::new(FailsAfterOneStt {
+                calls: AtomicUsize::new(0),
+            })),
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, _received_events) = unbounded_channel();
+        assert!(matches!(
+            run_pipeline(
+                job.clone(),
+                first_services,
+                CancellationToken::new(),
+                events,
+            )
+            .await,
+            Err(AppError::SttError(_))
+        ));
+        let checkpoint = checkpoint_file(directory.path());
+        assert!(checkpoint.exists());
+
+        let stt = Arc::new(CountingStt {
+            calls: AtomicUsize::new(0),
+        });
+        let services = Arc::new(Services {
+            translator: None,
+            stt: Some(Arc::clone(&stt) as Arc<dyn SttProvider>),
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        });
+        let (events, mut received_events) = unbounded_channel();
+        run_pipeline(job, services, CancellationToken::new(), events)
+            .await
+            .unwrap();
+
+        let events: Vec<_> = std::iter::from_fn(|| received_events.try_recv().ok()).collect();
+        let total = events
+            .iter()
+            .find_map(|event| match event {
+                TaskEvent::CheckpointResumed {
+                    phase: CheckpointPhase::Stt,
+                    completed: 1,
+                    total,
+                } => Some(*total),
+                _ => None,
+            })
+            .expect("expected STT resume event");
+        assert!(total >= 2);
+        assert_eq!(stt.calls.load(Ordering::SeqCst), total - 1);
+        assert!(!checkpoint.exists());
     }
 
     #[tokio::test]
@@ -682,7 +1334,7 @@ mod tests {
             ffmpeg: Arc::new(Ffmpeg),
         };
         let (events, mut received_events) = unbounded_channel();
-        let document = load_stt_document(&job, &services, &CancellationToken::new(), &events)
+        let document = load_stt_document(&job, &services, &CancellationToken::new(), &events, None)
             .await
             .unwrap();
 

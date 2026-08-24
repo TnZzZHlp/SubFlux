@@ -18,6 +18,12 @@ pub struct BatchSummary {
     pub failed: Vec<BatchFailure>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CheckpointPhase {
+    Stt,
+    Translation,
+}
+
 /// Events published by background commands. The TUI consumes these events but
 /// never reaches into a running pipeline to inspect mutable state.
 #[derive(Clone, Debug)]
@@ -78,6 +84,11 @@ pub enum TaskEvent {
     TracksLoaded(MediaProbe),
     ExtractingSubtitle,
     ExtractingAudio,
+    CheckpointResumed {
+        phase: CheckpointPhase,
+        completed: usize,
+        total: usize,
+    },
     SttStarted {
         current: usize,
         total: usize,

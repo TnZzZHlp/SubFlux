@@ -26,8 +26,9 @@ Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
 - OpenAI-compatible chat-completions translator and STT client, plus an
   Anthropic-compatible messages translator, built directly with `reqwest` and
   `serde`; translation responses use SSE streaming.
-- Strict ID-based batched translation responses, bounded retries, progress
-  events, and cancellation with `C` or `Esc` on the Processing page.
+- Strict ID-based batched translation responses, bounded retries, disk-backed
+  STT/translation checkpoints, progress events, and cancellation with `C` or
+  `Esc` on the Processing page.
 - Three output modes: translated text only, original-plus-translation
   bilingual subtitles, or original text only. Original-only output skips
   translator provider setup and requests.
@@ -241,9 +242,20 @@ desired type before starting the task.
 
 STT produces SRT by default. A standalone subtitle such as `movie.ja.ass`
 becomes `movie.zh-CN.ass` in translated-only mode. Existing outputs always prompt for confirmation; `Y`/`Enter` overwrites and
-`N`/`Esc` skips. In a batch, the first existing output prompts once; that
+`N`/`Esc` skips. The prompt occurs before subtitle extraction, audio extraction,
+STT, or translation. In a batch, the first existing output prompts once; that
 decision applies to every existing output in the batch, which is recorded as
 skipped rather than failed.
+
+After every successful STT audio chunk and translation chunk, SubFlux saves a
+hidden checkpoint under `.subflux/` beside the final output. A later run
+automatically resumes matching work and shows the restored progress; completed
+chunks are not sent to FFmpeg or providers again. A checkpoint is reused only
+when the input metadata, resolved source/track, languages, STT settings, and
+translator settings match. Changing only the output mode can reuse it. The
+checkpoint is removed after the final subtitle is written successfully; it is
+kept after cancellation or failure. Delete the corresponding `.subflux/*.checkpoint.json`
+file to force a fresh run.
 
 ## Known limits in the first version
 
@@ -253,11 +265,6 @@ skipped rather than failed.
   provider and machine can handle more.
 - No subtitle burn-in, remuxing translated subtitles into a video, or video
   re-encoding.
-- STT chunks are processed sequentially and kept in memory until translation;
-  disk checkpoint/resume for partial STT progress is intentionally not
-  implemented.
-- A translation retry keeps completed chunks in memory; disk checkpoint/resume
-  is intentionally not implemented in the first version.
 
 ## Development checks
 

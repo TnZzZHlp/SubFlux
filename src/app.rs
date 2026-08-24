@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     action::Action,
     config::{Config, LanguageCode},
-    event::{BatchSummary, TaskEvent},
+    event::{BatchSummary, CheckpointPhase, TaskEvent},
     media::{MediaProbe, ToolStatus, TrackIndex},
     output::build_output_path,
     pipeline::{BatchJob, BatchSubtitleInput, PipelineJob, SubtitleInput},
@@ -1094,6 +1094,21 @@ impl App {
             TaskEvent::ExtractingAudio => {
                 self.batch_file(current, total, video).stage = "正在提取音频…".into();
             }
+            TaskEvent::CheckpointResumed {
+                phase,
+                completed,
+                total: file_total,
+            } => {
+                let file = self.batch_file(current, total, video);
+                file.stage = match phase {
+                    CheckpointPhase::Stt => "正在恢复语音识别…",
+                    CheckpointPhase::Translation => "正在恢复翻译…",
+                }
+                .into();
+                file.completed = completed;
+                file.total = Some(file_total);
+                file.request = None;
+            }
             TaskEvent::SttStarted {
                 current: completed,
                 total: file_total,
@@ -1264,6 +1279,20 @@ impl App {
             }
             TaskEvent::ExtractingSubtitle => self.processing.stage = "正在提取字幕…".into(),
             TaskEvent::ExtractingAudio => self.processing.stage = "正在提取音频…".into(),
+            TaskEvent::CheckpointResumed {
+                phase,
+                completed,
+                total,
+            } => {
+                self.processing.stage = match phase {
+                    CheckpointPhase::Stt => "正在恢复语音识别…",
+                    CheckpointPhase::Translation => "正在恢复翻译…",
+                }
+                .into();
+                self.processing.completed = completed;
+                self.processing.total = Some(total);
+                self.processing.request = None;
+            }
             TaskEvent::SttStarted { current, total } => {
                 self.processing.stage = "正在进行语音识别…".into();
                 self.processing.completed = current;
@@ -1671,6 +1700,40 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert!(matches!(commands.as_slice(), [Command::Cancel(_)]));
+    }
+
+    #[test]
+    fn checkpoint_resume_updates_single_and_batch_progress() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let mut app = App::new(config, ToolStatus::default());
+        app.page = Page::Processing;
+        app.update(Action::Task(Box::new(TaskEvent::CheckpointResumed {
+            phase: CheckpointPhase::Translation,
+            completed: 3,
+            total: 8,
+        })));
+
+        assert_eq!(app.processing.stage, "正在恢复翻译…");
+        assert_eq!(app.processing.completed, 3);
+        assert_eq!(app.processing.total, Some(8));
+
+        let video = PathBuf::from("episode.mkv");
+        app.update(Action::Task(Box::new(TaskEvent::BatchVideoEvent {
+            current: 1,
+            total: 1,
+            video: video.clone(),
+            event: Box::new(TaskEvent::CheckpointResumed {
+                phase: CheckpointPhase::Stt,
+                completed: 2,
+                total: 4,
+            }),
+        })));
+
+        let file = app.processing.batch.unwrap().active.remove(&1).unwrap();
+        assert_eq!(file.video, video);
+        assert_eq!(file.stage, "正在恢复语音识别…");
+        assert_eq!(file.completed, 2);
+        assert_eq!(file.total, Some(4));
     }
 
     #[test]

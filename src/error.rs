@@ -48,6 +48,8 @@ pub enum AppError {
     SttError(String),
     #[error("translation failed: {0}")]
     TranslationError(String),
+    #[error("checkpoint error: {0}")]
+    CheckpointError(String),
     #[error("output already exists: {}", .0.display())]
     OutputExists(PathBuf),
     #[error("output skipped: {}", .0.display())]
@@ -80,6 +82,7 @@ impl AppError {
             | Self::InvalidApiResponse(message)
             | Self::SttError(message)
             | Self::TranslationError(message)
+            | Self::CheckpointError(message)
             | Self::InvalidConfig(message) => limit(message, 500),
             _ => self.to_string(),
         }

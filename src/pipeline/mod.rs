@@ -1,4 +1,5 @@
 pub mod batch;
+pub(crate) mod checkpoint;
 pub mod job;
 pub mod stt;
 pub mod subtitle;
