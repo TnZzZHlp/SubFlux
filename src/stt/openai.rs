@@ -124,13 +124,11 @@ pub(crate) fn parse_verbose_json(bytes: &[u8]) -> Result<SttResult> {
     let mut segments = Vec::with_capacity(response.segments.len());
     for (index, segment) in response.segments.into_iter().enumerate() {
         let start_ms = seconds_to_ms(segment.start, index, "start")?;
-        let end_ms = seconds_to_ms(segment.end, index, "end")?;
-        if end_ms < start_ms {
-            return Err(AppError::SttError(format!(
-                "STT segment {} ends before it starts",
-                index + 1
-            )));
-        }
+        // Cap the end of a segment so it can never precede its start. Speech
+        // recognition can emit sub-millisecond or boundary-skipping timestamps
+        // at tight transitions; rounding a near-zero-duration segment to the
+        // same or lower ms should not discard the whole transcript.
+        let end_ms = seconds_to_ms(segment.end, index, "end")?.max(start_ms + 1);
         segments.push(SpeechSegment {
             start_ms,
             end_ms,
@@ -201,5 +199,20 @@ mod tests {
         .unwrap();
         assert_eq!(result.segments[0].start_ms, 1200);
         assert_eq!(result.segments[0].end_ms, 4700);
+    }
+
+    #[test]
+    fn tolerates_a_segment_whose_end_precedes_its_start() {
+        // Whisper-style STT can emit a tight transition where the rounded end
+        // lands at or below the rounded start; that must not abort the whole
+        // transcript. The end is clamped to start + 1ms instead.
+        let result = parse_verbose_json(
+            br#"{"language":"en","segments":[{"start":12.0006,"end":11.9998,"text":"tight"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(result.segments.len(), 1);
+        assert_eq!(result.segments[0].start_ms, 12001);
+        assert_eq!(result.segments[0].end_ms, 12002);
+        assert_eq!(result.segments[0].text, "tight");
     }
 }
