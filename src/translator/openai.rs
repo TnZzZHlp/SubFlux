@@ -74,6 +74,7 @@ impl OpenAiCompatibleTranslator {
             model: &self.model,
             temperature: None,
             stream: true,
+            reasoning_effort: Some("max"),
             messages: vec![
                 Message {
                     role: "system",
@@ -151,6 +152,8 @@ struct OpenAiRequest<'a> {
     temperature: Option<f32>,
     stream: bool,
     messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
 }
@@ -411,6 +414,7 @@ mod tests {
             temperature: Some(0.2),
             stream: true,
             messages: Vec::new(),
+            reasoning_effort: Some("max"),
             response_format: Some(response_format(&request)),
         };
         let body = serde_json::to_value(payload).unwrap();
@@ -435,6 +439,7 @@ mod tests {
             stream: true,
             messages: Vec::new(),
             response_format: None,
+            reasoning_effort: None,
         };
 
         assert!(
