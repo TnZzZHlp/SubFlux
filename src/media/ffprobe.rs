@@ -81,22 +81,35 @@ pub async fn probe_media(path: &Path) -> Result<MediaProbe> {
     })?;
     let subtitle_tracks = parsed
         .streams
-        .into_iter()
+        .iter()
         .filter(|stream| stream.codec_type.as_deref() == Some("subtitle"))
         .map(|stream| {
-            let codec = stream.codec_name.unwrap_or_else(|| "unknown".into());
+            let codec = stream
+                .codec_name
+                .clone()
+                .unwrap_or_else(|| "unknown".into());
             SubtitleTrack {
                 index: TrackIndex(stream.index),
                 kind: classify_codec(&codec),
                 codec,
-                language: stream.tags.as_ref().and_then(|tags| tags.language.clone()),
-                title: stream.tags.and_then(|tags| tags.title),
+                language: stream
+                    .tags
+                    .as_ref()
+                    .and_then(|tags| tags.language.clone()),
+                title: stream.tags.as_ref().and_then(|tags| tags.title.clone()),
                 default: stream.disposition.default != 0,
                 forced: stream.disposition.forced != 0,
             }
         })
         .collect();
-    Ok(MediaProbe { subtitle_tracks })
+    let has_audio = parsed
+        .streams
+        .iter()
+        .any(|stream| stream.codec_type.as_deref() == Some("audio"));
+    Ok(MediaProbe {
+        subtitle_tracks,
+        has_audio,
+    })
 }
 
 /// Reads the container duration once so STT can plan bounded upload chunks

@@ -480,6 +480,13 @@ async fn load_stt_document(
 ) -> Result<SubtitleDocument> {
     let video = job.video_required()?;
     send(events, TaskEvent::Probing);
+    // Detect stream layout before planning chunks so a file with no audio
+    // track fails with a clear diagnostic instead of an ffmpeg
+    // "output file does not contain any stream" error mid-extraction.
+    let probe = probe_media(video).await?;
+    if !probe.has_audio_stream() {
+        return Err(AppError::NoAudioStream);
+    }
     let duration = probe_duration(video).await?;
     let chunks = plan_audio_chunks(
         duration,
@@ -1359,5 +1366,62 @@ mod tests {
                 total: Some(1)
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn stt_rejects_video_without_an_audio_track() {
+        if !check_tools().is_ready() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("no-audio.mkv");
+        // Build a container with a video stream only: ffmpeg's `color` source
+        // yields pixels but no audio, matching the Tubi stream that surfaced
+        // the "output file does not contain any stream" failure.
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:d=1",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&video)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "fixture generation failed: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let job = PipelineJob {
+            video: Some(video),
+            input: SubtitleInput::Stt,
+            source_language: LanguageCode::auto(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
+            config,
+        };
+        let services = Services {
+            translator: Some(Arc::new(MockTranslator)),
+            stt: Some(Arc::new(FlacCheckingStt)),
+            subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
+            ffmpeg: Arc::new(Ffmpeg),
+        };
+        let (events, _received_events) = unbounded_channel();
+        let result = load_stt_document(&job, &services, &CancellationToken::new(), &events, None)
+            .await;
+        assert!(
+            matches!(result, Err(AppError::NoAudioStream)),
+            "expected NoAudioStream, got {result:?}"
+        );
     }
 }

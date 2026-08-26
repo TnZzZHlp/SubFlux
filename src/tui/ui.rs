@@ -368,6 +368,7 @@ mod tests {
         app.page = Page::Tracks;
         app.video_path = "movie.mkv".into();
         app.tracks = MediaProbe {
+            has_audio: true,
             subtitle_tracks: (0..20)
                 .map(|index| SubtitleTrack {
                     index: TrackIndex(index),

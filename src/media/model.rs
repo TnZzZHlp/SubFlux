@@ -71,9 +71,18 @@ impl SubtitleTrack {
 #[derive(Clone, Debug, Default)]
 pub struct MediaProbe {
     pub subtitle_tracks: Vec<SubtitleTrack>,
+    /// Whether the media container carries at least one audio stream. STT
+    /// ingestion requires audio; probing this up front prevents a confusing
+    /// ffmpeg "output file does not contain any stream" failure downstream.
+    pub has_audio: bool,
 }
 
 impl MediaProbe {
+    /// True when speech recognition can extract an audio track from the media.
+    pub const fn has_audio_stream(&self) -> bool {
+        self.has_audio
+    }
+
     /// Auto selection is deliberately limited to textual tracks. SDH tracks
     /// take priority, followed by the container default. Image tracks are
     /// surfaced to the UI but never fed into the text subtitle pipeline.
@@ -119,6 +128,7 @@ mod tests {
     #[test]
     fn auto_ignores_image_subtitle() {
         let probe = MediaProbe {
+            has_audio: true,
             subtitle_tracks: vec![
                 SubtitleTrack {
                     index: TrackIndex(2),
@@ -146,6 +156,7 @@ mod tests {
     #[test]
     fn auto_prefers_sdh_before_default_text_subtitles() {
         let probe = MediaProbe {
+            has_audio: true,
             subtitle_tracks: vec![
                 SubtitleTrack {
                     index: TrackIndex(1),

@@ -28,6 +28,8 @@ pub enum AppError {
     ProbeFailed(String),
     #[error("audio extraction failed: {0}")]
     AudioExtractionFailed(String),
+    #[error("media has no audio stream; speech recognition needs an audio track")]
+    NoAudioStream,
     #[error("subtitle extraction failed: {0}")]
     SubtitleExtractionFailed(String),
     #[error("unsupported subtitle codec: {0}")]

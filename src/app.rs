@@ -1557,6 +1557,7 @@ mod tests {
 
     fn text_probe(index: u32) -> MediaProbe {
         MediaProbe {
+            has_audio: true,
             subtitle_tracks: vec![SubtitleTrack {
                 index: TrackIndex(index),
                 codec: "subrip".into(),
