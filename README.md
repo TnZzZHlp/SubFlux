@@ -17,7 +17,8 @@ Rust FFI and does not use an OpenAI, Anthropic, or other provider SDK.
   directory is scanned recursively for supported videos. The selection page
   can start a configurable-concurrency batch over every discovered video.
 - Auto selection prioritizes text subtitle tracks marked SDH, then the
-  default text track, falling back to STT when no text track exists.
+  default text track, then a same-stem external text subtitle, falling back to
+  STT when none exists.
 - Manual selection of an embedded track, an external `.srt`, `.ass`, `.ssa`,
   or `.vtt` file, or STT.
 - SRT, ASS/SSA, and WebVTT parsing that replaces only translatable text.
@@ -124,7 +125,8 @@ calls `POST /v1/messages` with `x-api-key`, `anthropic-version`, and Anthropic's
 structured-output field, SubFlux retries that request once without the field. Authentication,
 network, timeout, rate-limit, schema, and other API errors do not trigger this fallback. The
 STT provider calls the OpenAI-compatible `POST /v1/audio/transcriptions` endpoint as multipart
-form data with `response_format=verbose_json`; a response without timestamped `segments` is
+form data with `response_format=verbose_json` plus segment and word timestamp granularities.
+Word timestamps tighten each subtitle's start time; a response without timestamped `segments` is
 rejected.
 
 For an existing subtitle only the translator key is needed. STT is checked when
@@ -180,8 +182,8 @@ Batch mode. Press `V` to inspect the video list, `Enter` there to choose one for
 the single-file workflow, or `B` to process all discovered videos in order.
 
 Batch processing supports **Auto** (each video chooses its own SDH-preferred
-text track, then its default text track, and falls back to STT) and explicit
-**STT**. A selected embedded-track
+text track, then its default text track, then a same-stem external text subtitle,
+and falls back to STT) and explicit **STT**. A selected embedded-track
 index or one external subtitle path cannot safely apply to unrelated videos,
 so those modes are rejected for a batch. `SUBFLUX_BATCH_CONCURRENCY` controls how many
 videos run at once and defaults to `1`. The Processing page shows the batch

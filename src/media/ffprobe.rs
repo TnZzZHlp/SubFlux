@@ -92,10 +92,7 @@ pub async fn probe_media(path: &Path) -> Result<MediaProbe> {
                 index: TrackIndex(stream.index),
                 kind: classify_codec(&codec),
                 codec,
-                language: stream
-                    .tags
-                    .as_ref()
-                    .and_then(|tags| tags.language.clone()),
+                language: stream.tags.as_ref().and_then(|tags| tags.language.clone()),
                 title: stream.tags.as_ref().and_then(|tags| tags.title.clone()),
                 default: stream.disposition.default != 0,
                 forced: stream.disposition.forced != 0,

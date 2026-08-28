@@ -71,6 +71,8 @@ impl SttProvider for OpenAiCompatibleStt {
         let mut form = multipart::Form::new()
             .text("model", self.model.clone())
             .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "segment")
+            .text("timestamp_granularities[]", "word")
             .part("file", audio);
         if let Some(language) = input
             .language
@@ -113,25 +115,39 @@ pub(crate) fn parse_verbose_json(bytes: &[u8]) -> Result<SttResult> {
     let response: VerboseResponse = serde_json::from_slice(bytes).map_err(|error| {
         AppError::InvalidApiResponse(format!("invalid STT verbose_json response: {error}"))
     })?;
-    if response.segments.is_empty() {
+    let VerboseResponse {
+        language,
+        segments: response_segments,
+        words,
+    } = response;
+    if response_segments.is_empty() {
         return Err(AppError::SttError(
             "STT response has no timestamped segments; verbose_json segments are required".into(),
         ));
     }
-    let language = response
-        .language
-        .and_then(|value| LanguageCode::parse(value).ok());
-    let mut segments = Vec::with_capacity(response.segments.len());
-    for (index, segment) in response.segments.into_iter().enumerate() {
-        let start_ms = seconds_to_ms(segment.start, index, "start")?;
+    let word_starts = words
+        .into_iter()
+        .enumerate()
+        .map(|(index, word)| seconds_to_ms(word.start, index, "word start"))
+        .collect::<Result<Vec<_>>>()?;
+    let language = language.and_then(|value| LanguageCode::parse(value).ok());
+    let mut segments = Vec::with_capacity(response_segments.len());
+    for (index, segment) in response_segments.into_iter().enumerate() {
+        let segment_start_ms = seconds_to_ms(segment.start, index, "start")?;
         // Cap the end of a segment so it can never precede its start. Speech
         // recognition can emit sub-millisecond or boundary-skipping timestamps
         // at tight transitions; rounding a near-zero-duration segment to the
         // same or lower ms should not discard the whole transcript.
-        let end_ms = seconds_to_ms(segment.end, index, "end")?.max(start_ms + 1);
+        let end_ms =
+            seconds_to_ms(segment.end, index, "end")?.max(segment_start_ms.saturating_add(1));
+        let start_ms = word_starts
+            .iter()
+            .copied()
+            .find(|word_start_ms| *word_start_ms >= segment_start_ms && *word_start_ms <= end_ms)
+            .unwrap_or(segment_start_ms);
         segments.push(SpeechSegment {
             start_ms,
-            end_ms,
+            end_ms: end_ms.max(start_ms.saturating_add(1)),
             text: segment.text,
         });
     }
@@ -172,6 +188,13 @@ struct VerboseResponse {
     language: Option<String>,
     #[serde(default)]
     segments: Vec<VerboseSegment>,
+    #[serde(default)]
+    words: Vec<VerboseWord>,
+}
+
+#[derive(Deserialize)]
+struct VerboseWord {
+    start: f64,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +222,27 @@ mod tests {
         .unwrap();
         assert_eq!(result.segments[0].start_ms, 1200);
         assert_eq!(result.segments[0].end_ms, 4700);
+    }
+
+    #[test]
+    fn uses_word_timestamp_to_remove_leading_silence() {
+        let result = parse_verbose_json(
+            br#"{"language":"en","words":[{"word":"hello","start":4.2,"end":4.7}],"segments":[{"start":0.0,"end":5.0,"text":"hello"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(result.segments[0].start_ms, 4_200);
+        assert_eq!(result.segments[0].end_ms, 5_000);
+    }
+
+    #[test]
+    fn ignores_word_timestamps_outside_a_segment() {
+        let result = parse_verbose_json(
+            br#"{"words":[{"word":"later","start":5.1,"end":5.5}],"segments":[{"start":0.0,"end":5.0,"text":"hello"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(result.segments[0].start_ms, 0);
     }
 
     #[test]

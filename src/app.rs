@@ -1438,7 +1438,7 @@ impl App {
 
     pub const fn source_mode_label(&self) -> &'static str {
         match self.source_mode {
-            SourceMode::Auto => "自动（默认文本字幕轨，否则语音识别）",
+            SourceMode::Auto => "自动（默认文本字幕轨、同名外部字幕，否则语音识别）",
             SourceMode::Embedded => "指定内嵌字幕轨",
             SourceMode::External => "外部字幕文件",
             SourceMode::Stt => "语音识别（STT）",

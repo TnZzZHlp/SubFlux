@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use tokio::sync::{
     Mutex, OnceCell, OwnedMutexGuard,
@@ -327,6 +331,13 @@ impl ResolvedInput {
         matches!(self, Self::Stt)
     }
 
+    fn external_path(&self) -> Option<&Path> {
+        match self {
+            Self::External { path, .. } => Some(path),
+            Self::Embedded { .. } | Self::Stt => None,
+        }
+    }
+
     const fn track_index(&self) -> Option<u32> {
         match self {
             Self::Embedded { track, .. } => Some(track.index.0),
@@ -387,7 +398,10 @@ async fn resolve_input(
                     "{}：当前字幕轨为图像字幕，不支持直接翻译。请选择 STT 模式。",
                     track.codec
                 ))),
-                None if matches!(&job.input, SubtitleInput::Auto) => Ok(ResolvedInput::Stt),
+                None if matches!(&job.input, SubtitleInput::Auto) => Ok(sidecar_subtitle(video)
+                    .map_or(ResolvedInput::Stt, |(path, format)| {
+                        ResolvedInput::External { path, format }
+                    })),
                 None => Err(AppError::ProbeFailed(
                     "selected subtitle track no longer exists in this video".into(),
                 )),
@@ -396,12 +410,26 @@ async fn resolve_input(
     }
 }
 
+fn sidecar_subtitle(video: &Path) -> Option<(PathBuf, SubtitleFormat)> {
+    [
+        SubtitleFormat::Srt,
+        SubtitleFormat::Ass,
+        SubtitleFormat::Ssa,
+        SubtitleFormat::Vtt,
+    ]
+    .into_iter()
+    .find_map(|format| {
+        let path = video.with_extension(format.extension());
+        path.is_file().then_some((path, format))
+    })
+}
+
 fn checkpoint_identity(job: &PipelineJob, resolved: &ResolvedInput) -> Result<CheckpointIdentity> {
     let mut inputs = Vec::new();
     if let Some(video) = job.video.as_deref() {
         inputs.push(fingerprint(video)?);
     }
-    if let Some(external) = job.external_subtitle_path() {
+    if let Some(external) = resolved.external_path() {
         inputs.push(fingerprint(external)?);
     }
     let requested_input = match &job.input {
@@ -765,6 +793,49 @@ mod tests {
         let checkpoint = entries.next().unwrap().unwrap().path();
         assert!(entries.next().is_none());
         checkpoint
+    }
+
+    #[test]
+    fn auto_discovers_a_same_stem_sidecar_subtitle() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("movie.mp4");
+        let subtitle = video.with_extension("srt");
+        std::fs::write(&video, []).unwrap();
+        std::fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\nhello\n").unwrap();
+
+        assert_eq!(
+            sidecar_subtitle(&video),
+            Some((subtitle, SubtitleFormat::Srt))
+        );
+    }
+
+    #[test]
+    fn auto_sidecar_is_included_in_the_checkpoint_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("movie.mp4");
+        let subtitle = video.with_extension("srt");
+        std::fs::write(&video, []).unwrap();
+        std::fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\nhello\n").unwrap();
+        let job = PipelineJob {
+            video: Some(video),
+            input: SubtitleInput::Auto,
+            source_language: LanguageCode::parse("en").unwrap(),
+            target_language: LanguageCode::parse("zh-CN").unwrap(),
+            output_mode: SubtitleOutputMode::Translated,
+            config: Config::from_map(&HashMap::new()).unwrap(),
+        };
+
+        let identity = checkpoint_identity(
+            &job,
+            &ResolvedInput::External {
+                path: subtitle.clone(),
+                format: SubtitleFormat::Srt,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(identity.inputs.len(), 2);
+        assert_eq!(identity.inputs[1], fingerprint(&subtitle).unwrap());
     }
 
     #[tokio::test]
@@ -1417,8 +1488,8 @@ mod tests {
             ffmpeg: Arc::new(Ffmpeg),
         };
         let (events, _received_events) = unbounded_channel();
-        let result = load_stt_document(&job, &services, &CancellationToken::new(), &events, None)
-            .await;
+        let result =
+            load_stt_document(&job, &services, &CancellationToken::new(), &events, None).await;
         assert!(
             matches!(result, Err(AppError::NoAudioStream)),
             "expected NoAudioStream, got {result:?}"
