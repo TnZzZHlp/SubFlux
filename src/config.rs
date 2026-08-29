@@ -143,6 +143,7 @@ pub struct TranslatorConfig {
     pub base_url: String,
     pub api_key: ApiKey,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub chunk_size: usize,
     pub context_before: usize,
     pub context_after: usize,
@@ -215,6 +216,8 @@ impl Config {
                 "openai"
             },
         ))?;
+        let reasoning_effort =
+            get("SUBFLUX_TRANSLATOR_REASONING_EFFORT").filter(|value| !value.is_empty());
         let (chunk_size_name, chunk_size_value) = get("SUBFLUX_TRANSLATOR_CHUNK_SIZE")
             .map(|value| ("SUBFLUX_TRANSLATOR_CHUNK_SIZE", value))
             .or_else(|| {
@@ -272,6 +275,7 @@ impl Config {
                 base_url: get_or("SUBFLUX_TRANSLATOR_BASE_URL", "https://api.openai.com/v1"),
                 api_key: ApiKey::new(get_or("SUBFLUX_TRANSLATOR_API_KEY", "")),
                 model: get_or("SUBFLUX_TRANSLATOR_MODEL", "gpt-4o-mini"),
+                reasoning_effort,
                 chunk_size,
                 context_before,
                 context_after,
@@ -394,6 +398,38 @@ mod tests {
             Config::from_map(&zero),
             Err(AppError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn loads_optional_reasoning_effort_without_trimming() {
+        let configured = HashMap::from([(
+            "SUBFLUX_TRANSLATOR_REASONING_EFFORT".into(),
+            " high ".into(),
+        )]);
+        assert_eq!(
+            Config::from_map(&configured)
+                .unwrap()
+                .translator
+                .reasoning_effort
+                .as_deref(),
+            Some(" high ")
+        );
+
+        let empty = HashMap::from([("SUBFLUX_TRANSLATOR_REASONING_EFFORT".into(), String::new())]);
+        assert!(
+            Config::from_map(&empty)
+                .unwrap()
+                .translator
+                .reasoning_effort
+                .is_none()
+        );
+        assert!(
+            Config::from_map(&HashMap::new())
+                .unwrap()
+                .translator
+                .reasoning_effort
+                .is_none()
+        );
     }
 
     #[test]

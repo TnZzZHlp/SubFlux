@@ -98,6 +98,8 @@ SUBFLUX_TRANSLATOR_API_FORMAT=openai
 SUBFLUX_TRANSLATOR_BASE_URL=https://api.example.com/v1
 SUBFLUX_TRANSLATOR_API_KEY=replace-me
 SUBFLUX_TRANSLATOR_MODEL=model-name
+# Optional OpenAI reasoning_effort; empty or unset omits the field.
+# SUBFLUX_TRANSLATOR_REASONING_EFFORT=high
 SUBFLUX_TRANSLATOR_CHUNK_SIZE=30
 SUBFLUX_TRANSLATOR_CONTEXT_BEFORE=10
 SUBFLUX_TRANSLATOR_CONTEXT_AFTER=5
@@ -119,7 +121,10 @@ SUBFLUX_RUST_LOG=info
 ```
 
 `SUBFLUX_TRANSLATOR_API_FORMAT=openai` calls `POST /v1/chat/completions` with a Bearer
-token and strict `response_format.json_schema`. `SUBFLUX_TRANSLATOR_API_FORMAT=anthropic`
+token and strict `response_format.json_schema`. When
+`SUBFLUX_TRANSLATOR_REASONING_EFFORT` is non-empty, its value is sent as-is in
+`reasoning_effort`; an empty or unset value omits the field.
+`SUBFLUX_TRANSLATOR_API_FORMAT=anthropic`
 calls `POST /v1/messages` with `x-api-key`, `anthropic-version`, and Anthropic's
 `output_config.format` JSON schema. If a compatible service explicitly rejects its
 structured-output field, SubFlux retries that request once without the field. Authentication,

@@ -460,6 +460,7 @@ fn checkpoint_identity(job: &PipelineJob, resolved: &ResolvedInput) -> Result<Ch
             api_format: format!("{:?}", job.config.translator.api_format),
             base_url: job.config.translator.base_url.clone(),
             model: job.config.translator.model.clone(),
+            reasoning_effort: job.config.translator.reasoning_effort.clone(),
             chunk_size: job.config.translator.chunk_size,
             context_before: job.config.translator.context_before,
             context_after: job.config.translator.context_after,

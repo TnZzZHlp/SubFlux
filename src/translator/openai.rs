@@ -26,6 +26,7 @@ pub struct OpenAiCompatibleTranslator {
     endpoint: Url,
     api_key: String,
     model: String,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiCompatibleTranslator {
@@ -44,6 +45,7 @@ impl OpenAiCompatibleTranslator {
             endpoint: endpoint(&config.base_url, "chat/completions")?,
             api_key: config.api_key.expose().to_owned(),
             model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort.clone(),
         })
     }
 
@@ -74,7 +76,7 @@ impl OpenAiCompatibleTranslator {
             model: &self.model,
             temperature: None,
             stream: true,
-            reasoning_effort: Some("max"),
+            reasoning_effort: self.reasoning_effort.as_deref(),
             messages: vec![
                 Message {
                     role: "system",
@@ -153,7 +155,7 @@ struct OpenAiRequest<'a> {
     stream: bool,
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
 }
@@ -419,6 +421,7 @@ mod tests {
         };
         let body = serde_json::to_value(payload).unwrap();
 
+        assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(
             body["response_format"]["json_schema"]["name"],
@@ -442,11 +445,8 @@ mod tests {
             reasoning_effort: None,
         };
 
-        assert!(
-            serde_json::to_value(payload)
-                .unwrap()
-                .get("response_format")
-                .is_none()
-        );
+        let body = serde_json::to_value(payload).unwrap();
+        assert!(body.get("response_format").is_none());
+        assert!(body.get("reasoning_effort").is_none());
     }
 }

@@ -17,7 +17,7 @@ use crate::{
 const CHECKPOINT_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct InputFingerprint {
+pub struct InputFingerprint {
     path: PathBuf,
     length: u64,
     modified_seconds: u64,
@@ -25,7 +25,7 @@ pub(crate) struct InputFingerprint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SttCheckpointSettings {
+pub struct SttCheckpointSettings {
     pub provider: String,
     pub base_url: String,
     pub model: String,
@@ -35,11 +35,13 @@ pub(crate) struct SttCheckpointSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct TranslatorCheckpointSettings {
+pub struct TranslatorCheckpointSettings {
     pub provider: String,
     pub api_format: String,
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub chunk_size: usize,
     pub context_before: usize,
     pub context_after: usize,
@@ -47,7 +49,7 @@ pub(crate) struct TranslatorCheckpointSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct CheckpointIdentity {
+pub struct CheckpointIdentity {
     pub inputs: Vec<InputFingerprint>,
     pub requested_input: String,
     pub resolved_input: String,
@@ -90,7 +92,7 @@ struct SavedTranslationChunk {
     entries: Vec<TranslationItem>,
 }
 
-pub(crate) struct CheckpointStore {
+pub struct CheckpointStore {
     path: PathBuf,
     data: PersistedCheckpoint,
 }
@@ -124,15 +126,15 @@ impl CheckpointStore {
         Ok(Self { path, data })
     }
 
-    pub(crate) fn stt_len(&self) -> usize {
+    pub(crate) const fn stt_len(&self) -> usize {
         self.data.stt_chunks.len()
     }
 
-    pub(crate) fn has_translations(&self) -> bool {
+    pub(crate) const fn has_translations(&self) -> bool {
         !self.data.translation_chunks.is_empty()
     }
 
-    pub(crate) fn translation_len(&self) -> usize {
+    pub(crate) const fn translation_len(&self) -> usize {
         self.data.translation_chunks.len()
     }
 
@@ -254,7 +256,7 @@ impl CheckpointStore {
 }
 
 impl PersistedCheckpoint {
-    fn new(identity: CheckpointIdentity) -> Self {
+    const fn new(identity: CheckpointIdentity) -> Self {
         Self {
             version: CHECKPOINT_VERSION,
             identity,
@@ -282,7 +284,7 @@ impl PersistedCheckpoint {
     }
 }
 
-pub(crate) fn fingerprint(path: &Path) -> Result<InputFingerprint> {
+pub fn fingerprint(path: &Path) -> Result<InputFingerprint> {
     let path = path.canonicalize()?;
     let metadata = std::fs::metadata(&path)?;
     let modified = metadata
@@ -353,6 +355,7 @@ mod tests {
                 api_format: "OpenAi".into(),
                 base_url: "https://example.invalid/v1".into(),
                 model: "translator".into(),
+                reasoning_effort: None,
                 chunk_size: 30,
                 context_before: 10,
                 context_after: 5,
@@ -417,6 +420,22 @@ mod tests {
         assert_eq!(loaded.stt_len(), 1);
         assert_eq!(loaded.stt_results().unwrap()[0].segments[0].text, "source");
 
+        let mut legacy = serde_json::to_value(&checkpoint.data).unwrap();
+        legacy["identity"]["translator"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_effort");
+        tokio::fs::write(&path, serde_json::to_vec(&legacy).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            CheckpointStore::load(&output, expected.clone())
+                .await
+                .unwrap()
+                .stt_len(),
+            1
+        );
+
         let mut metadata_mismatch = expected.clone();
         metadata_mismatch.inputs[0].length += 1;
         assert_eq!(
@@ -431,6 +450,16 @@ mod tests {
         settings_mismatch.translator.max_retries += 1;
         assert_eq!(
             CheckpointStore::load(&output, settings_mismatch)
+                .await
+                .unwrap()
+                .stt_len(),
+            0
+        );
+
+        let mut reasoning_mismatch = expected.clone();
+        reasoning_mismatch.translator.reasoning_effort = Some("high".into());
+        assert_eq!(
+            CheckpointStore::load(&output, reasoning_mismatch)
                 .await
                 .unwrap()
                 .stt_len(),
