@@ -43,7 +43,7 @@ outstanding todo. The README's "Development checks" list is the canonical gate.
 - Lint: `cargo lint` — required by the project. IMPORTANT: it is a local cargo
   alias (`clippy --allow-dirty --fix --all-targets --all-features -- -D clippy::pedantic -D clippy::nursery -D clippy::cargo ...`). It actively applies
   clippy auto-fixes to source files AND its fixed output can break `cargo fmt
-  --check` (e.g. it rewrites `.map_or_else`/`match` forms into unformatted
+--check` (e.g. it rewrites `.map_or_else`/`match` forms into unformatted
   one-liners). It can exit 0 while leaving clippy warnings. For a non-mutating
   gate that passes on the committed code: `cargo clippy --no-deps --all-targets --all-features -- -D warnings` (verified: clean exit 0). If you run `cargo lint`,
   re-run `cargo fmt` afterward to restore formatting.
@@ -54,7 +54,6 @@ outstanding todo. The README's "Development checks" list is the canonical gate.
 - Layering: the TUI never probes, extracts, writes, or does HTTP during a render pass. Providers are constructed only in `Services::from_config`; the pipeline talks to `Translator` / `SttProvider` / `SubtitleSource` / `SubtitleWriter` traits — no `if openai { ... } else if anthropic` branching.
 - Subtitle round-trip: parsers keep the full original document and record byte ranges for translatable text; rendering replaces only those ranges (ASS/SSA styles, override tags, headers, attachments, and unknown sections stay intact). Never send timestamps, styles, or formatting tags to an LLM.
 - Translation pipeline invariants: context (`previous_context` / `next_context`) is read-only, always source-language, never translated or written back; each subtitle ID is translated and written back exactly once; responses are strictly validated (exact ID set, count, order, no duplicates, no timestamps, no context IDs) before write-back; progress counts only `segments`, not context.
-- Secrets: API keys are masked in the TUI and redacted from errors/logs; logs must never include authorization headers or subtitle bodies.
 - Tests: unit tests live in each module's `#[cfg(test)] mod tests`; no external test framework; `#[tokio::test]` for async; `tempfile` for filesystem tests. Keep tests alongside the code they cover.
 
 ## Pitfalls
@@ -63,4 +62,3 @@ outstanding todo. The README's "Development checks" list is the canonical gate.
 - The binary is `subtitle-translator` (Cargo.toml `[[bin]]`), while the library crate is `subflux`; code imports `subflux::…` from the binary.
 - PATH-dependent tests: `media::ffmpeg::tests::probes_and_extracts_a_real_embedded_srt_when_ffmpeg_is_available` requires `ffmpeg`/`ffprobe` on PATH; the rest do not.
 - `.gitignore` excludes `target/`, the local `.env`, and `subtitle-translator.log` — never commit those.
-- `PLAN.md` describes the already-implemented context feature; do not re-implement or treat it as pending work.

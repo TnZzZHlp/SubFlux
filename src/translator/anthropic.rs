@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use crate::{
     config::TranslatorConfig,
-    error::{AppError, Result, api_response_error},
+    error::{AppError, Result, api_response_error, upstream_request_id},
 };
 
 use super::{
@@ -90,9 +90,15 @@ impl AnthropicCompatibleTranslator {
         let mut response = self.send_request(&payload, cancellation).await?;
         if !response.status().is_success() {
             let status = response.status();
+            let request_id = upstream_request_id(response.headers());
             let bytes = response.bytes().await.map_err(AppError::Http)?;
             if !rejects_structured_output_field(status.as_u16(), &bytes, "output_config") {
-                return Err(api_error(status.as_u16(), &bytes, &self.api_key));
+                return Err(api_error(
+                    status.as_u16(),
+                    request_id.as_deref(),
+                    &bytes,
+                    &self.api_key,
+                ));
             }
             warn!(
                 status = status.as_u16(),
@@ -103,8 +109,14 @@ impl AnthropicCompatibleTranslator {
         }
         let status = response.status();
         if !status.is_success() {
+            let request_id = upstream_request_id(response.headers());
             let bytes = response.bytes().await.map_err(AppError::Http)?;
-            return Err(api_error(status.as_u16(), &bytes, &self.api_key));
+            return Err(api_error(
+                status.as_u16(),
+                request_id.as_deref(),
+                &bytes,
+                &self.api_key,
+            ));
         }
         let events = read_response(response, cancellation).await?;
         let content = stream_content(&events)?;
@@ -210,12 +222,12 @@ fn stream_content(events: &[SseEvent]) -> Result<String> {
     }
 }
 
-fn api_error(status: u16, bytes: &[u8], api_key: &str) -> AppError {
+fn api_error(status: u16, request_id: Option<&str>, bytes: &[u8], secret: &str) -> AppError {
     warn!(
         status,
         "Anthropic-compatible provider rejected translation request"
     );
-    api_response_error(status, bytes, api_key)
+    api_response_error(status, request_id, bytes, secret)
 }
 
 #[cfg(test)]

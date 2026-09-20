@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use crate::{
     config::{LanguageCode, SttConfig},
-    error::{AppError, Result, api_response_error},
+    error::{AppError, Result, api_response_error, upstream_request_id},
     subtitle::SpeechSegment,
     translator::openai::endpoint,
 };
@@ -93,6 +93,7 @@ impl SttProvider for OpenAiCompatibleStt {
             () = cancellation.cancelled() => return Err(AppError::Cancelled),
         };
         let status = response.status();
+        let request_id = upstream_request_id(response.headers());
         let bytes = response.bytes().await.map_err(AppError::Http)?;
         debug!(
             model = %self.model,
@@ -100,15 +101,20 @@ impl SttProvider for OpenAiCompatibleStt {
             "OpenAI-compatible STT response received"
         );
         if !status.is_success() {
-            return Err(api_error(status.as_u16(), &bytes, &self.api_key));
+            return Err(api_error(
+                status.as_u16(),
+                request_id.as_deref(),
+                &bytes,
+                &self.api_key,
+            ));
         }
         parse_verbose_json(&bytes)
     }
 }
 
-fn api_error(status: u16, bytes: &[u8], api_key: &str) -> AppError {
+fn api_error(status: u16, request_id: Option<&str>, bytes: &[u8], secret: &str) -> AppError {
     warn!(status, "OpenAI-compatible STT provider rejected request");
-    api_response_error(status, bytes, api_key)
+    api_response_error(status, request_id, bytes, secret)
 }
 
 pub(crate) fn parse_verbose_json(bytes: &[u8]) -> Result<SttResult> {
