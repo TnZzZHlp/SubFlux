@@ -18,9 +18,10 @@ use subflux::{
     config::Config,
     error::AppError,
     event::TaskEvent,
-    media::{check_tools, discover_videos, probe_media},
+    media::{check_tools, discover_videos},
     pipeline::{run_batch, run_pipeline},
     services::Services,
+    subtitle::catalog::probe_subtitles,
     tui::{TuiTerminal, spawn_input},
 };
 
@@ -129,9 +130,13 @@ fn execute(command: Command, events: tokio::sync::mpsc::UnboundedSender<TaskEven
     match command {
         Command::Probe { path, request_id } => {
             tokio::spawn(async move {
-                match probe_media(&path).await {
-                    Ok(probe) => {
-                        let _ = events.send(TaskEvent::ProbeSucceeded { request_id, probe });
+                match probe_subtitles(&path).await {
+                    Ok((probe, external_subtitles)) => {
+                        let _ = events.send(TaskEvent::ProbeSucceeded {
+                            request_id,
+                            probe,
+                            external_subtitles,
+                        });
                     }
                     Err(error) => {
                         let message = error.safe_message();

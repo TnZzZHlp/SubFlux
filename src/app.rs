@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -14,7 +14,10 @@ use crate::{
     media::{MediaProbe, ToolStatus, TrackIndex},
     output::build_output_path,
     pipeline::{BatchJob, BatchSubtitleInput, PipelineJob, SubtitleInput},
-    subtitle::{SubtitleFormat, SubtitleOutputMode},
+    subtitle::{
+        SubtitleFormat, SubtitleOutputMode,
+        catalog::{SubtitleFile, language_matches, preferred_track},
+    },
 };
 
 const SOURCE_LANGUAGES: &[&str] = &["auto", "ja", "en", "ko", "zh-CN", "zh-TW", "fr", "de", "es"];
@@ -78,6 +81,7 @@ pub enum HomeField {
     SourceLanguage,
     TargetLanguage,
     Output,
+    ForceTranslation,
     Start,
 }
 
@@ -148,6 +152,7 @@ pub struct ResultState {
 pub struct OverwritePrompt {
     pub output: PathBuf,
     pub batch: bool,
+    pub target_subtitle: Option<String>,
     response: UnboundedSender<bool>,
 }
 
@@ -163,10 +168,12 @@ pub struct App {
     pub source_mode: SourceMode,
     pub selected_track: Option<TrackIndex>,
     pub tracks: MediaProbe,
+    pub external_subtitles: Vec<SubtitleFile>,
     pub track_cursor: usize,
     pub source_language: LanguageCode,
     pub target_language: LanguageCode,
     pub output_mode: SubtitleOutputMode,
+    pub force_translation: bool,
     pub home_mode: HomeMode,
     pub input_mode: InputMode,
     pub home_field: HomeField,
@@ -177,6 +184,7 @@ pub struct App {
     pub result: ResultState,
     pub status_message: Option<String>,
     pub overwrite_prompt: Option<OverwritePrompt>,
+    pending_prompts: VecDeque<OverwritePrompt>,
     cancellation: Option<CancellationToken>,
     next_probe_request: u64,
     active_probe_request: Option<u64>,
@@ -217,6 +225,7 @@ impl App {
             source_language: config.source_language.clone(),
             target_language: config.target_language.clone(),
             output_mode: SubtitleOutputMode::default(),
+            force_translation: false,
             config,
             tools,
             video_path: String::new(),
@@ -226,6 +235,7 @@ impl App {
             source_mode: SourceMode::Auto,
             selected_track: None,
             tracks: MediaProbe::default(),
+            external_subtitles: Vec::new(),
             track_cursor: 0,
             home_mode: HomeMode::Single,
             input_mode: InputMode::Navigate,
@@ -237,6 +247,7 @@ impl App {
             result: ResultState::default(),
             status_message,
             overwrite_prompt: None,
+            pending_prompts: VecDeque::new(),
             cancellation: None,
             next_probe_request: 0,
             active_probe_request: None,
@@ -320,8 +331,9 @@ impl App {
                     Some("批量模式仅支持自动字幕来源或语音识别，无需选择单条字幕轨。".into());
                 Vec::new()
             }
-            KeyCode::Char('t' | 'T') => {
-                self.page = Page::Tracks;
+            KeyCode::Char('t' | 'T') => self.open_subtitles(),
+            KeyCode::Char('f' | 'F') => {
+                self.force_translation = !self.force_translation;
                 Vec::new()
             }
             KeyCode::Char('v' | 'V') if !self.video_candidates.is_empty() => {
@@ -407,7 +419,7 @@ impl App {
     }
 
     fn handle_tracks_key(&mut self, key: KeyEvent) -> Vec<Command> {
-        let maximum = self.tracks.subtitle_tracks.len().saturating_sub(1);
+        let maximum = self.subtitle_count().saturating_sub(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('h' | 'H') => self.page = Page::Home,
             KeyCode::Char('a' | 'A') => {
@@ -443,6 +455,19 @@ impl App {
                         self.status_message =
                             Some("当前字幕轨不能直接翻译，请选择语音识别模式（按 X）。".into());
                     }
+                } else if let Some(file) = self.external_subtitles.get(
+                    self.track_cursor
+                        .saturating_sub(self.tracks.subtitle_tracks.len()),
+                ) {
+                    self.source_mode = SourceMode::External;
+                    self.selected_track = None;
+                    let Some(path) = file.path.to_str() else {
+                        self.status_message = Some("所选字幕路径不是有效的 UTF-8 文本。".into());
+                        return Vec::new();
+                    };
+                    self.external_subtitle_path = path.into();
+                    self.status_message = Some(format!("已选择 {}", file.display_label()));
+                    self.page = Page::Home;
                 }
             }
             KeyCode::Char('p' | 'P') => return self.probe_command(),
@@ -489,7 +514,17 @@ impl App {
         };
         let output = prompt.output;
         let batch = prompt.batch;
+        let target_subtitle = prompt.target_subtitle.is_some();
         let _ = prompt.response.send(overwrite);
+        self.overwrite_prompt = self.pending_prompts.pop_front();
+        if target_subtitle {
+            self.status_message = Some(if overwrite {
+                "仍将翻译；覆盖已有输出仍需单独确认。".into()
+            } else {
+                "不再翻译已有目标语言字幕的任务。".into()
+            });
+            return Vec::new();
+        }
         self.status_message = Some(match (batch, overwrite) {
             (true, true) => "将覆盖本批量任务中所有已有输出。".into(),
             (true, false) => "将跳过本批量任务中所有已有输出。".into(),
@@ -603,10 +638,7 @@ impl App {
                 self.adjust_source(1);
                 Vec::new()
             }
-            HomeField::Track => {
-                self.page = Page::Tracks;
-                Vec::new()
-            }
+            HomeField::Track => self.open_subtitles(),
             HomeField::SourceLanguage => {
                 self.cycle_language(true, 1);
                 Vec::new()
@@ -617,6 +649,10 @@ impl App {
             }
             HomeField::Output => {
                 self.adjust_output_mode(1);
+                Vec::new()
+            }
+            HomeField::ForceTranslation => {
+                self.force_translation = !self.force_translation;
                 Vec::new()
             }
             HomeField::Start => match self.home_mode {
@@ -647,15 +683,16 @@ impl App {
         let mut fields = vec![HomeField::Mode, HomeField::Video, HomeField::Source];
         if self.home_mode == HomeMode::Single {
             match self.source_mode {
-                SourceMode::Embedded => fields.push(HomeField::Track),
+                SourceMode::Auto | SourceMode::Embedded => fields.push(HomeField::Track),
                 SourceMode::External => fields.push(HomeField::ExternalSubtitle),
-                SourceMode::Auto | SourceMode::Stt => {}
+                SourceMode::Stt => {}
             }
         }
         fields.extend([
             HomeField::SourceLanguage,
             HomeField::TargetLanguage,
             HomeField::Output,
+            HomeField::ForceTranslation,
             HomeField::Start,
         ]);
         fields
@@ -701,6 +738,7 @@ impl App {
             HomeField::SourceLanguage => self.cycle_language(true, direction),
             HomeField::TargetLanguage => self.cycle_language(false, direction),
             HomeField::Output => self.adjust_output_mode(direction),
+            HomeField::ForceTranslation => self.force_translation = !self.force_translation,
             HomeField::Video
             | HomeField::ExternalSubtitle
             | HomeField::Track
@@ -791,6 +829,7 @@ impl App {
             | HomeField::SourceLanguage
             | HomeField::TargetLanguage
             | HomeField::Output
+            | HomeField::ForceTranslation
             | HomeField::Start => 0,
         }
     }
@@ -805,6 +844,7 @@ impl App {
             | HomeField::SourceLanguage
             | HomeField::TargetLanguage
             | HomeField::Output
+            | HomeField::ForceTranslation
             | HomeField::Start => None,
         }
     }
@@ -875,8 +915,21 @@ impl App {
         self.active_probe_request = None;
         self.probe_status = ProbeStatus::Idle;
         self.tracks = MediaProbe::default();
+        self.external_subtitles.clear();
         self.selected_track = None;
         self.track_cursor = 0;
+    }
+
+    fn open_subtitles(&mut self) -> Vec<Command> {
+        self.page = Page::Tracks;
+        if matches!(
+            self.probe_status,
+            ProbeStatus::Idle | ProbeStatus::Failed(_)
+        ) {
+            self.probe_command()
+        } else {
+            Vec::new()
+        }
     }
 
     fn probe_command(&mut self) -> Vec<Command> {
@@ -892,6 +945,7 @@ impl App {
         self.active_probe_request = Some(request_id);
         self.probe_status = ProbeStatus::Loading;
         self.tracks = MediaProbe::default();
+        self.external_subtitles.clear();
         self.selected_track = None;
         self.track_cursor = 0;
         self.status_message = None;
@@ -950,6 +1004,7 @@ impl App {
             source_language: self.source_language.clone(),
             target_language: self.target_language.clone(),
             output_mode: self.output_mode,
+            force_translation: self.force_translation,
             config: self.config.clone(),
         };
         self.processing = ProcessingState {
@@ -1012,6 +1067,7 @@ impl App {
             source_language: self.source_language.clone(),
             target_language: self.target_language.clone(),
             output_mode: self.output_mode,
+            force_translation: self.force_translation,
             config: self.config.clone(),
         };
         self.processing = ProcessingState {
@@ -1046,8 +1102,17 @@ impl App {
         }
     }
 
+    fn enqueue_prompt(&mut self, prompt: OverwritePrompt) {
+        if self.overwrite_prompt.is_some() {
+            self.pending_prompts.push_back(prompt);
+        } else {
+            self.overwrite_prompt = Some(prompt);
+        }
+    }
+
     fn clear_overwrite_prompts(&mut self) {
         self.overwrite_prompt = None;
+        self.pending_prompts.clear();
     }
 
     fn batch_state(&mut self, total: usize) -> &mut BatchProcessingState {
@@ -1148,17 +1213,33 @@ impl App {
             }
             TaskEvent::OverwriteRequested { output, response } => {
                 self.batch_file(current, total, video).stage = "等待覆盖确认…".into();
-                self.overwrite_prompt = Some(OverwritePrompt {
+                self.enqueue_prompt(OverwritePrompt {
                     output,
                     batch: false,
+                    target_subtitle: None,
                     response,
                 });
             }
             TaskEvent::BatchOverwriteRequested { output, response } => {
                 self.batch_file(current, total, video).stage = "等待批量覆盖确认…".into();
-                self.overwrite_prompt = Some(OverwritePrompt {
+                self.enqueue_prompt(OverwritePrompt {
                     output,
                     batch: true,
+                    target_subtitle: None,
+                    response,
+                });
+            }
+            TaskEvent::TargetSubtitleRequested {
+                subject,
+                subtitle,
+                batch,
+                response,
+            } => {
+                self.batch_file(current, total, video).stage = "等待重新翻译确认…".into();
+                self.enqueue_prompt(OverwritePrompt {
+                    output: subject,
+                    batch,
+                    target_subtitle: Some(subtitle),
                     response,
                 });
             }
@@ -1241,10 +1322,17 @@ impl App {
                 batch.failed += 1;
                 self.status_message = Some(format!("第 {current}/{total} 个视频处理失败：{error}"));
             }
-            TaskEvent::ProbeSucceeded { request_id, probe }
-                if self.active_probe_request == Some(request_id) =>
-            {
-                let selected = probe.auto_track().map(|track| track.index);
+            TaskEvent::ProbeSucceeded {
+                request_id,
+                probe,
+                external_subtitles,
+            } if self.active_probe_request == Some(request_id) => {
+                let selected = if self.output_mode.needs_translation() {
+                    preferred_track(&probe, &self.target_language)
+                } else {
+                    probe.auto_track()
+                }
+                .map(|track| track.index);
                 self.track_cursor = selected
                     .and_then(|index| {
                         probe
@@ -1253,10 +1341,11 @@ impl App {
                             .position(|track| track.index == index)
                     })
                     .unwrap_or(0);
-                let count = probe.subtitle_tracks.len();
+                let count = probe.subtitle_tracks.len() + external_subtitles.len();
                 self.active_probe_request = None;
                 self.selected_track = selected;
                 self.tracks = probe;
+                self.external_subtitles = external_subtitles;
                 self.probe_status = ProbeStatus::Ready(count);
                 self.status_message = None;
             }
@@ -1322,17 +1411,33 @@ impl App {
             }
             TaskEvent::OverwriteRequested { output, response } => {
                 self.processing.stage = "等待覆盖确认…".into();
-                self.overwrite_prompt = Some(OverwritePrompt {
+                self.enqueue_prompt(OverwritePrompt {
                     output,
                     batch: false,
+                    target_subtitle: None,
                     response,
                 });
             }
             TaskEvent::BatchOverwriteRequested { output, response } => {
                 self.processing.stage = "等待批量覆盖确认…".into();
-                self.overwrite_prompt = Some(OverwritePrompt {
+                self.enqueue_prompt(OverwritePrompt {
                     output,
                     batch: true,
+                    target_subtitle: None,
+                    response,
+                });
+            }
+            TaskEvent::TargetSubtitleRequested {
+                subject,
+                subtitle,
+                batch,
+                response,
+            } => {
+                self.processing.stage = "等待重新翻译确认…".into();
+                self.enqueue_prompt(OverwritePrompt {
+                    output: subject,
+                    batch,
+                    target_subtitle: Some(subtitle),
                     response,
                 });
             }
@@ -1438,7 +1543,7 @@ impl App {
 
     pub const fn source_mode_label(&self) -> &'static str {
         match self.source_mode {
-            SourceMode::Auto => "自动（默认文本字幕轨、同名外部字幕，否则语音识别）",
+            SourceMode::Auto => "自动（文本字幕轨、关联外部字幕，否则语音识别）",
             SourceMode::Embedded => "指定内嵌字幕轨",
             SourceMode::External => "外部字幕文件",
             SourceMode::Stt => "语音识别（STT）",
@@ -1454,7 +1559,53 @@ impl App {
         }
     }
 
+    pub const fn subtitle_count(&self) -> usize {
+        self.tracks.subtitle_tracks.len() + self.external_subtitles.len()
+    }
+
+    pub fn subtitle_label(&self, index: usize) -> Option<String> {
+        let (label, language) = if let Some(track) = self.tracks.subtitle_tracks.get(index) {
+            (
+                format!("内嵌  {}", track.display_label()),
+                track.language.as_deref(),
+            )
+        } else {
+            let file = self
+                .external_subtitles
+                .get(index.checked_sub(self.tracks.subtitle_tracks.len())?)?;
+            (file.display_label(), file.language.as_deref())
+        };
+        Some(
+            if language.is_some_and(|language| language_matches(language, &self.target_language)) {
+                format!("{label}  [目标语言，可重新翻译]")
+            } else {
+                label
+            },
+        )
+    }
+
+    pub fn subtitle_selectable(&self, index: usize) -> bool {
+        self.tracks.subtitle_tracks.get(index).map_or_else(
+            || index < self.subtitle_count(),
+            super::media::model::SubtitleTrack::is_text,
+        )
+    }
+
+    fn automatic_track(&self) -> Option<&crate::media::SubtitleTrack> {
+        if self.output_mode.needs_translation() {
+            preferred_track(&self.tracks, &self.target_language)
+        } else {
+            self.tracks.auto_track()
+        }
+    }
+
     pub fn selected_track_label(&self) -> String {
+        if self.source_mode == SourceMode::Auto {
+            return self.automatic_track().map_or_else(
+                || "自动 / 按 Enter 选择字幕".into(),
+                |track| format!("自动 / {}（Enter 选择）", track.display_label()),
+            );
+        }
         self.selected_track
             .and_then(|index| self.tracks.track(index))
             .map_or_else(
@@ -1482,8 +1633,7 @@ impl App {
                 .and_then(super::media::model::SubtitleTrack::format)
                 .unwrap_or(SubtitleFormat::Srt),
             SourceMode::Auto => self
-                .tracks
-                .auto_track()
+                .automatic_track()
                 .and_then(super::media::model::SubtitleTrack::format)
                 .unwrap_or(SubtitleFormat::Srt),
         };
@@ -1907,6 +2057,7 @@ mod tests {
         let _ = app.update(Action::Task(Box::new(TaskEvent::ProbeSucceeded {
             request_id: first_id,
             probe: text_probe(1),
+            external_subtitles: Vec::new(),
         })));
         assert_eq!(app.probe_status, ProbeStatus::Loading);
         assert_eq!(app.tracks.subtitle_tracks, Vec::new());
@@ -1914,6 +2065,7 @@ mod tests {
         let _ = app.update(Action::Task(Box::new(TaskEvent::ProbeSucceeded {
             request_id: second_id,
             probe: text_probe(4),
+            external_subtitles: Vec::new(),
         })));
         assert_eq!(app.probe_status, ProbeStatus::Ready(1));
         assert_eq!(app.selected_track, Some(TrackIndex(4)));
@@ -2272,6 +2424,7 @@ mod tests {
                 source_language: LanguageCode::auto(),
                 target_language: LanguageCode::parse("zh-CN").unwrap(),
                 output_mode: SubtitleOutputMode::Translated,
+                force_translation: false,
                 config,
             }),
             failed_cursor: 1,

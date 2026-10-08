@@ -15,8 +15,10 @@ use crate::{
     config::{Config, LanguageCode},
     error::{AppError, Result},
     event::{CheckpointPhase, TaskEvent},
-    media::{SubtitleTrack, TrackIndex, plan_audio_chunks, probe_duration, probe_media},
-    output::build_output_path,
+    media::{
+        MediaProbe, SubtitleTrack, TrackIndex, plan_audio_chunks, probe_duration, probe_media,
+    },
+    output::{build_output_path, protect::protect_source_output},
     services::Services,
     stt::SttInput,
     subtitle::{
@@ -52,6 +54,7 @@ pub struct PipelineJob {
     pub source_language: LanguageCode,
     pub target_language: LanguageCode,
     pub output_mode: SubtitleOutputMode,
+    pub force_translation: bool,
     pub config: Config,
 }
 
@@ -73,6 +76,7 @@ impl PipelineJob {
 #[derive(Clone, Default)]
 pub(crate) struct BatchOverwrite {
     decision: Arc<OnceCell<bool>>,
+    translation_decision: Arc<OnceCell<bool>>,
     output_locks: OutputLocks,
 }
 
@@ -152,7 +156,8 @@ async fn run_pipeline_inner(
     batch_overwrite: Option<&BatchOverwrite>,
 ) -> Result<PathBuf> {
     check_cancelled(&cancellation)?;
-    let resolved = resolve_input(&job, &events).await?;
+    let mut probe = None;
+    let resolved = resolve_input(&job, &events, &mut probe).await?;
     check_cancelled(&cancellation)?;
     let output = build_output_path(
         job.video.as_deref(),
@@ -160,13 +165,55 @@ async fn run_pipeline_inner(
         &job.target_language,
         resolved.format(),
     )?;
+    let (output, protected_source) =
+        protect_source_output(output, resolved.external_path()).await?;
     let _output_lock = match batch_overwrite {
         Some(batch_overwrite) => Some(batch_overwrite.lock_output(&output, &cancellation).await?),
         None => None,
     };
     check_cancelled(&cancellation)?;
-    let overwrite = confirm_output(&output, &events, &cancellation, batch_overwrite).await?;
+    if job.output_mode.needs_translation()
+        && !job.force_translation
+        && let Some(subtitle) =
+            super::selection::existing_target(&job, &output, probe.as_ref()).await?
+    {
+        let subject = job
+            .video
+            .as_deref()
+            .or_else(|| resolved.external_path())
+            .unwrap_or(&output);
+        let approved = if let Some(batch) = batch_overwrite {
+            *batch
+                .translation_decision
+                .get_or_try_init(|| {
+                    super::selection::confirm_translation(
+                        subject,
+                        &subtitle,
+                        true,
+                        &events,
+                        &cancellation,
+                    )
+                })
+                .await?
+        } else {
+            super::selection::confirm_translation(subject, &subtitle, false, &events, &cancellation)
+                .await?
+        };
+        if !approved {
+            return Err(if batch_overwrite.is_some() {
+                AppError::Skipped(subject.to_path_buf())
+            } else {
+                AppError::Cancelled
+            });
+        }
+    }
 
+    check_cancelled(&cancellation)?;
+    let overwrite = if protected_source {
+        false
+    } else {
+        confirm_output(&output, &events, &cancellation, batch_overwrite).await?
+    };
     let identity = checkpoint_identity(&job, &resolved)?;
     let mut checkpoint = CheckpointStore::load(&output, identity).await?;
     let mut document = load_document(
@@ -357,6 +404,7 @@ impl ResolvedInput {
 async fn resolve_input(
     job: &PipelineJob,
     events: &UnboundedSender<TaskEvent>,
+    loaded_probe: &mut Option<MediaProbe>,
 ) -> Result<ResolvedInput> {
     match &job.input {
         SubtitleInput::External(path) => {
@@ -383,10 +431,16 @@ async fn resolve_input(
             let probe = probe_media(video).await?;
             send(events, TaskEvent::TracksLoaded(probe.clone()));
             let track = match &job.input {
-                SubtitleInput::Auto => probe.auto_track().cloned(),
+                SubtitleInput::Auto => if job.output_mode.needs_translation() {
+                    crate::subtitle::catalog::preferred_track(&probe, &job.target_language)
+                } else {
+                    probe.auto_track()
+                }
+                .cloned(),
                 SubtitleInput::Embedded(index) => probe.track(*index).cloned(),
                 SubtitleInput::External(_) | SubtitleInput::Stt => unreachable!(),
             };
+            *loaded_probe = Some(probe);
             match track {
                 Some(track) if track.is_text() => {
                     let format = track
@@ -398,30 +452,33 @@ async fn resolve_input(
                     "{}：当前字幕轨为图像字幕，不支持直接翻译。请选择 STT 模式。",
                     track.codec
                 ))),
-                None if matches!(&job.input, SubtitleInput::Auto) => Ok(sidecar_subtitle(video)
-                    .map_or(ResolvedInput::Stt, |(path, format)| {
-                        ResolvedInput::External { path, format }
-                    })),
+                None if matches!(&job.input, SubtitleInput::Auto) => {
+                    let files = crate::subtitle::catalog::discover_subtitles(video).await?;
+                    let file = files
+                        .iter()
+                        .find(|file| {
+                            !file.language.as_deref().is_some_and(|language| {
+                                crate::subtitle::catalog::language_matches(
+                                    language,
+                                    &job.target_language,
+                                )
+                            })
+                        })
+                        .or_else(|| files.first());
+                    Ok(
+                        file.map_or(ResolvedInput::Stt, |file| ResolvedInput::External {
+                            path: file.path.clone(),
+                            format: SubtitleFormat::from_path(&file.path)
+                                .expect("discovered subtitle has a format"),
+                        }),
+                    )
+                }
                 None => Err(AppError::ProbeFailed(
                     "selected subtitle track no longer exists in this video".into(),
                 )),
             }
         }
     }
-}
-
-fn sidecar_subtitle(video: &Path) -> Option<(PathBuf, SubtitleFormat)> {
-    [
-        SubtitleFormat::Srt,
-        SubtitleFormat::Ass,
-        SubtitleFormat::Ssa,
-        SubtitleFormat::Vtt,
-    ]
-    .into_iter()
-    .find_map(|format| {
-        let path = video.with_extension(format.extension());
-        path.is_file().then_some((path, format))
-    })
 }
 
 fn checkpoint_identity(job: &PipelineJob, resolved: &ResolvedInput) -> Result<CheckpointIdentity> {
@@ -796,18 +853,19 @@ mod tests {
         checkpoint
     }
 
-    #[test]
-    fn auto_discovers_a_same_stem_sidecar_subtitle() {
+    #[tokio::test]
+    async fn auto_discovers_a_same_stem_sidecar_subtitle() {
         let directory = tempfile::tempdir().unwrap();
         let video = directory.path().join("movie.mp4");
         let subtitle = video.with_extension("srt");
         std::fs::write(&video, []).unwrap();
         std::fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:01,000\nhello\n").unwrap();
 
-        assert_eq!(
-            sidecar_subtitle(&video),
-            Some((subtitle, SubtitleFormat::Srt))
-        );
+        let files = crate::subtitle::catalog::discover_subtitles(&video)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, subtitle);
     }
 
     #[test]
@@ -823,6 +881,7 @@ mod tests {
             source_language: LanguageCode::parse("en").unwrap(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config: Config::from_map(&HashMap::new()).unwrap(),
         };
 
@@ -870,6 +929,7 @@ mod tests {
                 source_language: LanguageCode::parse("en").unwrap(),
                 target_language: LanguageCode::parse("zh-CN").unwrap(),
                 output_mode: SubtitleOutputMode::Translated,
+                force_translation: false,
                 config,
             },
             services,
@@ -906,6 +966,7 @@ mod tests {
                 source_language: LanguageCode::parse("en").unwrap(),
                 target_language: LanguageCode::parse("zh-CN").unwrap(),
                 output_mode: SubtitleOutputMode::Original,
+                force_translation: false,
                 config,
             },
             services,
@@ -951,6 +1012,7 @@ mod tests {
                 source_language: LanguageCode::parse("en").unwrap(),
                 target_language: LanguageCode::parse("zh-CN").unwrap(),
                 output_mode: SubtitleOutputMode::Original,
+                force_translation: false,
                 config,
             },
             services,
@@ -1002,6 +1064,7 @@ mod tests {
                 source_language: LanguageCode::parse("en").unwrap(),
                 target_language: LanguageCode::parse("zh-CN").unwrap(),
                 output_mode: SubtitleOutputMode::Original,
+                force_translation: false,
                 config: Config::from_map(&HashMap::new()).unwrap(),
             },
             services,
@@ -1045,6 +1108,7 @@ mod tests {
             source_language: LanguageCode::parse("en").unwrap(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Original,
+            force_translation: false,
             config: config.clone(),
         };
         let second_job = PipelineJob {
@@ -1053,6 +1117,7 @@ mod tests {
             source_language: LanguageCode::parse("ja").unwrap(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Original,
+            force_translation: false,
             config,
         };
         let services = Arc::new(Services {
@@ -1175,6 +1240,7 @@ mod tests {
                 source_language: LanguageCode::auto(),
                 target_language: LanguageCode::parse("zh-CN").unwrap(),
                 output_mode: SubtitleOutputMode::Translated,
+                force_translation: true,
                 config,
             },
             services,
@@ -1220,6 +1286,7 @@ mod tests {
             source_language: LanguageCode::parse("en").unwrap(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let failing = Arc::new(FailsAfterOneTranslator {
@@ -1312,6 +1379,7 @@ mod tests {
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Original,
+            force_translation: false,
             config,
         };
         let first_services = Arc::new(Services {
@@ -1404,6 +1472,7 @@ mod tests {
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let services = Services {
@@ -1480,6 +1549,7 @@ mod tests {
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let services = Services {

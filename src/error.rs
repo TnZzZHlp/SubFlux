@@ -6,7 +6,7 @@ use thiserror::Error;
 pub type Result<T, E = AppError> = std::result::Result<T, E>;
 
 /// Response headers that commonly carry an upstream request id, covering
-/// OpenAI (`x-request-id`, `openai-request-id`), Anthropic (`request-id`), and
+/// `OpenAI` (`x-request-id`, `openai-request-id`), Anthropic (`request-id`), and
 /// OpenAI-compatible gateways.
 const REQUEST_ID_HEADERS: [&str; 4] = [
     "x-request-id",

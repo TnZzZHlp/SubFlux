@@ -33,7 +33,7 @@ pub fn build_output_path(
     )))
 }
 
-fn strip_trailing_language(stem: &str) -> &str {
+pub(crate) fn strip_trailing_language(stem: &str) -> &str {
     let Some((base, candidate)) = stem.rsplit_once('.') else {
         return stem;
     };

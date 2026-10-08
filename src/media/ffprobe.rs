@@ -169,31 +169,6 @@ fn command_failure(stderr: &[u8]) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_a_positive_media_duration() {
-        assert_eq!(
-            parse_duration(b"12.345\n").unwrap(),
-            Duration::from_millis(12_345)
-        );
-    }
-
-    #[test]
-    fn rejects_missing_or_zero_media_duration() {
-        assert!(matches!(
-            parse_duration(b"N/A\n"),
-            Err(AppError::ProbeFailed(_))
-        ));
-        assert!(matches!(
-            parse_duration(b"0\n"),
-            Err(AppError::ProbeFailed(_))
-        ));
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct FfprobeOutput {
     #[serde(default)]
@@ -223,4 +198,29 @@ struct FfprobeDisposition {
     default: i32,
     #[serde(default)]
     forced: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_positive_media_duration() {
+        assert_eq!(
+            parse_duration(b"12.345\n").unwrap(),
+            Duration::from_millis(12_345)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_zero_media_duration() {
+        assert!(matches!(
+            parse_duration(b"N/A\n"),
+            Err(AppError::ProbeFailed(_))
+        ));
+        assert!(matches!(
+            parse_duration(b"0\n"),
+            Err(AppError::ProbeFailed(_))
+        ));
+    }
 }

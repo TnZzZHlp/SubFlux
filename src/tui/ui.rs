@@ -130,7 +130,31 @@ fn render_overwrite_prompt(frame: &mut Frame, app: &App, outer: Rect, mode: Layo
     let area = centered_rect(outer, if mode == LayoutMode::Tiny { 6 } else { 8 }, 80);
     let path_width = usize::from(area.width.saturating_sub(4));
     let path = truncate_text(&prompt.output.display().to_string(), path_width);
-    let lines = if area.height <= 5 {
+    let lines = if prompt.target_subtitle.is_some() && area.height <= 5 {
+        vec![Line::from("Y：翻译  N：跳过")]
+    } else if prompt.target_subtitle.is_some() && mode == LayoutMode::Tiny {
+        vec![
+            Line::from("已有目标语言字幕"),
+            Line::from("Y/Enter：仍翻译"),
+            Line::from("N/Esc：跳过"),
+        ]
+    } else if let Some(subtitle) = &prompt.target_subtitle {
+        vec![
+            Line::from(if prompt.batch {
+                "本批已发现目标语言字幕："
+            } else {
+                "已发现目标语言字幕："
+            }),
+            Line::from(truncate_text(subtitle, path_width)),
+            Line::from(path),
+            Line::from(if prompt.batch {
+                "Y/Enter：本批仍翻译    N/Esc：跳过已有目标字幕的任务"
+            } else {
+                "Y/Enter：仍然翻译    N/Esc：取消"
+            }),
+            Line::from("覆盖已有输出仍需单独确认。"),
+        ]
+    } else if area.height <= 5 {
         vec![Line::from("Y：覆盖  N：跳过")]
     } else if mode == LayoutMode::Tiny {
         vec![
@@ -162,7 +186,15 @@ fn render_overwrite_prompt(frame: &mut Frame, app: &App, outer: Rect, mode: Layo
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title(" 覆盖确认 ").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(if prompt.target_subtitle.is_some() {
+                        " 重新翻译确认 "
+                    } else {
+                        " 覆盖确认 "
+                    })
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -173,7 +205,7 @@ const fn page_label(page: Page) -> &'static str {
         Page::Home => "任务设置",
         Page::Videos => "视频选择",
         Page::Settings => "配置诊断",
-        Page::Tracks => "字幕轨道",
+        Page::Tracks => "字幕选择",
         Page::Processing => "处理进度",
         Page::Result => "处理结果",
     }
@@ -184,7 +216,7 @@ fn status_text(app: &App) -> String {
         Page::Home | Page::Tracks => match &app.probe_status {
             ProbeStatus::Idle => app.status_message.clone().unwrap_or_else(|| "就绪".into()),
             ProbeStatus::Loading => "正在探测字幕轨…".into(),
-            ProbeStatus::Ready(count) => format!("探测完成：找到 {count} 条字幕轨"),
+            ProbeStatus::Ready(count) => format!("探测完成：找到 {count} 个字幕来源"),
             ProbeStatus::Failed(error) => format!("探测失败：{error}"),
         },
         Page::Settings => match &app.reload_status {
@@ -217,7 +249,9 @@ fn help_text(app: &App) -> &'static str {
         Page::Home if app.input_mode == InputMode::Editing => {
             "Enter/Esc 完成编辑  ←/→ 移动  Home/End  Backspace/Delete"
         }
-        Page::Home => "Tab/↑/↓ 导航  Enter 选择  ←/→ 调整  V 视频  P 探测  T 轨道  S 设置  Q 退出",
+        Page::Home => {
+            "Tab/↑/↓ 导航  Enter 选择  ←/→ 调整  V 视频  P 探测  T 字幕  F 强制翻译  S 设置  Q 退出"
+        }
         Page::Videos => "↑/↓ 选择  Home/End  PageUp/PageDown  Enter 单选  B 批量  Esc 返回",
         Page::Settings => "R 重新加载  Esc 返回  Q 退出",
         Page::Tracks => "↑/↓ 选择  Home/End  Enter 确认  A 自动  X 语音识别  P 探测  Esc 返回",

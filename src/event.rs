@@ -75,6 +75,7 @@ pub enum TaskEvent {
     ProbeSucceeded {
         request_id: u64,
         probe: MediaProbe,
+        external_subtitles: Vec<crate::subtitle::catalog::SubtitleFile>,
     },
     ProbeFailed {
         request_id: u64,
@@ -104,6 +105,12 @@ pub enum TaskEvent {
         completed: usize,
         total: usize,
         request: usize,
+    },
+    TargetSubtitleRequested {
+        subject: PathBuf,
+        subtitle: String,
+        batch: bool,
+        response: UnboundedSender<bool>,
     },
     OverwriteRequested {
         output: PathBuf,

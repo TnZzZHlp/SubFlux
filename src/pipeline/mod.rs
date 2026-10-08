@@ -1,6 +1,7 @@
 pub mod batch;
 pub(crate) mod checkpoint;
 pub mod job;
+mod selection;
 pub mod stt;
 pub mod subtitle;
 

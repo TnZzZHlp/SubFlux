@@ -50,7 +50,12 @@ fn full_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Option<(u16, u16)
     push_field(&mut lines, &mut cursor, app, HomeField::Video, width);
     push_section(&mut lines, "2  字幕");
     push_field(&mut lines, &mut cursor, app, HomeField::Source, width);
-    if app.source_mode == crate::app::SourceMode::Embedded {
+    if app.home_mode == HomeMode::Single
+        && matches!(
+            app.source_mode,
+            crate::app::SourceMode::Auto | crate::app::SourceMode::Embedded
+        )
+    {
         push_field(&mut lines, &mut cursor, app, HomeField::Track, width);
     } else if app.source_mode == crate::app::SourceMode::External {
         push_field(
@@ -78,6 +83,13 @@ fn full_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Option<(u16, u16)
     );
     push_section(&mut lines, "4  输出");
     push_field(&mut lines, &mut cursor, app, HomeField::Output, width);
+    push_field(
+        &mut lines,
+        &mut cursor,
+        app,
+        HomeField::ForceTranslation,
+        width,
+    );
     let output_preview = if app.home_mode == HomeMode::Batch {
         format!("每个视频旁生成 <文件名>.{}.字幕格式", app.target_language)
     } else {
@@ -168,10 +180,11 @@ const fn field_label(field: HomeField) -> &'static str {
         HomeField::Video => "视频输入",
         HomeField::Source => "字幕来源",
         HomeField::ExternalSubtitle => "外部字幕",
-        HomeField::Track => "字幕轨道",
+        HomeField::Track => "选择字幕",
         HomeField::SourceLanguage => "源语言",
         HomeField::TargetLanguage => "目标语言",
         HomeField::Output => "输出类型",
+        HomeField::ForceTranslation => "强制翻译",
         HomeField::Start => "主操作",
     }
 }
@@ -212,6 +225,13 @@ fn field_value(app: &App, field: HomeField) -> String {
             app.target_language
         ),
         HomeField::Output => app.output_mode_label().into(),
+        HomeField::ForceTranslation => {
+            if app.force_translation {
+                "开启（已有目标字幕仍翻译，覆盖另行确认）".into()
+            } else {
+                "关闭（已有目标字幕时提示）".into()
+            }
+        }
         HomeField::Start if !app.tools.is_ready() => "[ 无法开始：媒体工具不可用 ]".into(),
         HomeField::Start if app.home_mode == HomeMode::Batch => {
             format!("[ 开始批量处理 {} 个视频 ]", app.video_candidates.len())

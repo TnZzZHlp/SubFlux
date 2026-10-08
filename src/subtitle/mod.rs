@@ -6,6 +6,7 @@
 //! timing lines, and unknown sections untouched.
 
 pub mod ass;
+pub mod catalog;
 pub(crate) mod lines;
 pub mod model;
 pub mod source;

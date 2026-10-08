@@ -37,6 +37,7 @@ pub struct BatchJob {
     pub source_language: LanguageCode,
     pub target_language: LanguageCode,
     pub output_mode: SubtitleOutputMode,
+    pub force_translation: bool,
     pub config: Config,
 }
 
@@ -51,6 +52,7 @@ impl BatchJob {
             source_language: self.source_language.clone(),
             target_language: self.target_language.clone(),
             output_mode: self.output_mode,
+            force_translation: self.force_translation,
             config: self.config.clone(),
         }
     }
@@ -306,6 +308,7 @@ mod tests {
             source_language: source_language.clone(),
             target_language: target_language.clone(),
             output_mode: SubtitleOutputMode::Bilingual,
+            force_translation: false,
             config,
         };
 
@@ -330,6 +333,7 @@ mod tests {
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let (events, mut received_events) = unbounded_channel();
@@ -390,6 +394,7 @@ mod tests {
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let (events, mut received_events) = unbounded_channel();
@@ -435,6 +440,7 @@ mod tests {
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let (events, mut received_events) = unbounded_channel();
@@ -494,6 +500,7 @@ mod tests {
             source_language: LanguageCode::auto(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let active = Arc::new(AtomicUsize::new(0));
@@ -537,6 +544,7 @@ mod tests {
             source_language: LanguageCode::parse("en").unwrap(),
             target_language: LanguageCode::parse("zh-CN").unwrap(),
             output_mode: SubtitleOutputMode::Translated,
+            force_translation: false,
             config,
         };
         let services = Arc::new(Services {
