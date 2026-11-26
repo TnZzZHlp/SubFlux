@@ -122,6 +122,7 @@ pub enum TaskEvent {
         response: UnboundedSender<bool>,
     },
     Writing,
+    Warning(String),
     Finished(PathBuf),
     BatchFinished(BatchSummary),
     Failed(String),

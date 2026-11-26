@@ -86,7 +86,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, mode: LayoutMode) {
     let width = usize::from(area.width.saturating_sub(2));
     let mut status = status_text(app);
-    if mode == LayoutMode::Compact {
+    if mode == LayoutMode::Compact && app.processing.warning.is_none() {
         status = format!("建议终端至少 80×24  |  {status}");
     }
     let lines = vec![
@@ -220,14 +220,22 @@ fn status_text(app: &App) -> String {
             ProbeStatus::Failed(error) => format!("探测失败：{error}"),
         },
         Page::Settings => match &app.reload_status {
-            ReloadStatus::Idle => "配置来自当前目录的 .env 和系统环境变量".into(),
+            ReloadStatus::Idle | ReloadStatus::Succeeded => format!(
+                "语音识别：{}",
+                if app.config.stt.uses_colab() {
+                    "Colab T4"
+                } else {
+                    app.config.stt.provider.as_str()
+                }
+            ),
             ReloadStatus::Loading => "正在重新加载配置…".into(),
-            ReloadStatus::Succeeded => "配置已重新加载".into(),
             ReloadStatus::Failed(error) => format!("重新加载失败：{error}"),
         },
         Page::Processing => app.processing.stage.clone(),
         Page::Result => {
-            if app.result.output.is_some() {
+            if let Some(warning) = &app.processing.warning {
+                warning.clone()
+            } else if app.result.output.is_some() {
                 "处理完成".into()
             } else if let Some(summary) = &app.result.batch {
                 format!(
@@ -253,7 +261,7 @@ fn help_text(app: &App) -> &'static str {
             "Tab/↑/↓ 导航  Enter 选择  ←/→ 调整  V 视频  P 探测  T 字幕  F 强制翻译  S 设置  Q 退出"
         }
         Page::Videos => "↑/↓ 选择  Home/End  PageUp/PageDown  Enter 单选  B 批量  Esc 返回",
-        Page::Settings => "R 重新加载  Esc 返回  Q 退出",
+        Page::Settings => "C 切换语音识别后端  R 重新加载  Esc 返回  Q 退出",
         Page::Tracks => "↑/↓ 选择  Home/End  Enter 确认  A 自动  X 语音识别  P 探测  Esc 返回",
         Page::Processing => "C/Esc 取消  ↑/↓、PageUp/PageDown 查看批量任务",
         Page::Result

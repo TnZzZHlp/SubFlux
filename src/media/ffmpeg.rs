@@ -115,12 +115,13 @@ impl Ffmpeg {
         let output_path = output.to_path_buf();
         let start = format_time_ms(chunk.source_start_ms);
         let duration = format_time_ms(chunk.duration_ms);
+        let align_audio = "aresample=16000:async=1:first_pts=0";
         debug!(
             input = %video.display(),
             source_start_ms = chunk.source_start_ms,
             duration_ms = chunk.duration_ms,
             ffmpeg_command = %format!(
-                "ffmpeg -nostdin -y -v error -ss {start} -i {} -t {duration} -vn -ac 1 -ar 16000 -c:a flac {}",
+                "ffmpeg -nostdin -y -v error -ss {start} -i {} -t {duration} -vn -ac 1 -af {align_audio} -c:a flac {}",
                 video.display(), output_path.display()
             ),
             "extracting bounded FLAC fragment for speech recognition"
@@ -130,7 +131,15 @@ impl Ffmpeg {
             .args(["-nostdin", "-y", "-v", "error", "-ss", &start, "-i"])
             .arg(video)
             .args([
-                "-t", &duration, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac",
+                "-t",
+                &duration,
+                "-vn",
+                "-ac",
+                "1",
+                "-af",
+                align_audio,
+                "-c:a",
+                "flac",
             ])
             .arg(&output_path);
         run_ffmpeg(command, cancellation, AppError::AudioExtractionFailed).await?;
@@ -211,6 +220,71 @@ mod tests {
     use crate::media::{check_tools, probe_media};
 
     use super::*;
+
+    #[tokio::test]
+    async fn keeps_audio_delay_relative_to_chunk_start() {
+        if !check_tools().is_ready() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("delayed.mkv");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=s=16x16:d=2",
+                "-itsoffset",
+                "1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(&video)
+            .status()
+            .await
+            .unwrap();
+        assert!(generated.success());
+        let audio = Ffmpeg
+            .extract_audio_chunk(
+                &video,
+                &AudioChunk {
+                    source_start_ms: 500,
+                    duration_ms: 1000,
+                    retain_start_ms: 500,
+                    retain_end_ms: 1500,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let decoded = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(audio.path())
+            .args(["-f", "s16le", "pipe:1"])
+            .output()
+            .await
+            .unwrap();
+        assert!(decoded.status.success());
+        let speech_start = decoded
+            .stdout
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .position(|sample| i16::from_le_bytes(*sample).unsigned_abs() > 50);
+        assert!(
+            matches!(speech_start, Some(7_984..=8_016)),
+            "{speech_start:?}"
+        );
+    }
 
     #[tokio::test]
     async fn probes_and_extracts_a_real_embedded_srt_when_ffmpeg_is_available() {

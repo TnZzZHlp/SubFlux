@@ -12,4 +12,8 @@ pub trait SttProvider: Send + Sync {
         input: SttInput,
         cancellation: &CancellationToken,
     ) -> Result<SttResult>;
+
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
 }

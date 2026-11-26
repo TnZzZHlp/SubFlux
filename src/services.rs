@@ -8,7 +8,7 @@ use crate::{
     config::Config,
     error::Result,
     media::Ffmpeg,
-    stt::{DynSttProvider, SttInput, SttProvider, SttResult, build_stt_provider},
+    stt::{DynSttProvider, SttInput, SttProvider, SttResult, build_stt_provider, colab::ColabStt},
     subtitle::{FileSubtitleWriter, SubtitleWriter},
     translator::{
         DynTranslator, TranslationRequest, TranslationResponse, Translator, build_translator,
@@ -31,14 +31,32 @@ pub struct Services {
 
 impl Services {
     pub fn from_config(config: &Config, needs_translation: bool) -> Result<Self> {
-        Ok(Self {
-            translator: (needs_translation && config.translator.api_key.is_configured())
-                .then(|| Arc::new(LazyTranslator::new(config.clone())) as DynTranslator),
-            stt: config
+        let stt = if config.stt.uses_colab() {
+            Some(Arc::new(ColabStt::new(false)) as DynSttProvider)
+        } else {
+            config
                 .stt
                 .api_key
                 .is_configured()
-                .then(|| Arc::new(LazyStt::new(config.clone())) as DynSttProvider),
+                .then(|| Arc::new(LazyStt::new(config.clone())) as DynSttProvider)
+        };
+        Ok(Self {
+            translator: (needs_translation && config.translator.api_key.is_configured())
+                .then(|| Arc::new(LazyTranslator::new(config.clone())) as DynTranslator),
+            stt,
+            subtitle_writer: Arc::new(FileSubtitleWriter),
+            ffmpeg: Arc::new(Ffmpeg),
+        })
+    }
+
+    pub fn for_colab(config: &mut Config, needs_translation: bool) -> Result<Self> {
+        let translator = needs_translation
+            .then(|| build_translator(config))
+            .transpose()?;
+        config.stt.provider = "colab".into();
+        Ok(Self {
+            translator,
+            stt: Some(Arc::new(ColabStt::new(true))),
             subtitle_writer: Arc::new(FileSubtitleWriter),
             ffmpeg: Arc::new(Ffmpeg),
         })

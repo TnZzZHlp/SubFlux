@@ -32,7 +32,7 @@ use super::{
         CheckpointIdentity, CheckpointStore, SttCheckpointSettings, TranslatorCheckpointSettings,
         fingerprint,
     },
-    stt::{ChunkedSttResults, document_from_stt_result},
+    stt::{ChunkedSttResults, close_provider, document_from_stt_result},
     subtitle::{
         TranslationContext, checkpoint_translations_valid, translate_document_with_checkpoint,
     },
@@ -149,7 +149,7 @@ pub(crate) async fn run_pipeline_with_batch_overwrite(
 }
 
 async fn run_pipeline_inner(
-    job: PipelineJob,
+    mut job: PipelineJob,
     services: Arc<Services>,
     cancellation: CancellationToken,
     events: UnboundedSender<TaskEvent>,
@@ -214,41 +214,25 @@ async fn run_pipeline_inner(
     } else {
         confirm_output(&output, &events, &cancellation, batch_overwrite).await?
     };
+    if resolved.is_stt() {
+        job.config.stt.normalize_colab()?;
+    }
     let identity = checkpoint_identity(&job, &resolved)?;
     let mut checkpoint = CheckpointStore::load(&output, identity).await?;
-    let mut document = load_document(
+    let loaded = load_validated_document(
         &job,
         &resolved,
         &services,
         &cancellation,
         &events,
-        Some(&mut checkpoint),
+        &mut checkpoint,
     )
-    .await?;
-    if job.output_mode.needs_translation()
-        && !checkpoint_translations_valid(
-            &document,
-            &job.source_language,
-            &job.target_language,
-            job.config.translator.chunk_size,
-            job.config.translator.context_before,
-            job.config.translator.context_after,
-            &checkpoint,
-        )?
-    {
-        checkpoint.clear().await?;
-        if resolved.is_stt() {
-            document = load_document(
-                &job,
-                &resolved,
-                &services,
-                &cancellation,
-                &events,
-                Some(&mut checkpoint),
-            )
-            .await?;
-        }
+    .await;
+    if resolved.is_stt() && batch_overwrite.is_none() {
+        close_provider(services.stt.as_deref(), &events).await;
     }
+    let mut document = loaded?;
+    check_cancelled(&cancellation)?;
     if job.output_mode.needs_translation() {
         let translator = services
             .translator
@@ -526,6 +510,50 @@ fn checkpoint_identity(job: &PipelineJob, resolved: &ResolvedInput) -> Result<Ch
     })
 }
 
+async fn load_validated_document(
+    job: &PipelineJob,
+    resolved: &ResolvedInput,
+    services: &Services,
+    cancellation: &CancellationToken,
+    events: &UnboundedSender<TaskEvent>,
+    checkpoint: &mut CheckpointStore,
+) -> Result<SubtitleDocument> {
+    let mut document = load_document(
+        job,
+        resolved,
+        services,
+        cancellation,
+        events,
+        Some(checkpoint),
+    )
+    .await?;
+    if job.output_mode.needs_translation()
+        && !checkpoint_translations_valid(
+            &document,
+            &job.source_language,
+            &job.target_language,
+            job.config.translator.chunk_size,
+            job.config.translator.context_before,
+            job.config.translator.context_after,
+            checkpoint,
+        )?
+    {
+        checkpoint.clear().await?;
+        if resolved.is_stt() {
+            document = load_document(
+                job,
+                resolved,
+                services,
+                cancellation,
+                events,
+                Some(checkpoint),
+            )
+            .await?;
+        }
+    }
+    Ok(document)
+}
+
 async fn load_document(
     job: &PipelineJob,
     resolved: &ResolvedInput,
@@ -789,6 +817,7 @@ mod tests {
 
     struct FailsAfterOneStt {
         calls: AtomicUsize,
+        closes: AtomicUsize,
     }
 
     #[async_trait]
@@ -803,6 +832,11 @@ mod tests {
             } else {
                 Err(AppError::SttError("intentional failure".into()))
             }
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1382,11 +1416,13 @@ mod tests {
             force_translation: false,
             config,
         };
+        let failing = Arc::new(FailsAfterOneStt {
+            calls: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
         let first_services = Arc::new(Services {
             translator: None,
-            stt: Some(Arc::new(FailsAfterOneStt {
-                calls: AtomicUsize::new(0),
-            })),
+            stt: Some(failing.clone()),
             subtitle_writer: Arc::new(FileSubtitleWriter) as Arc<dyn SubtitleWriter>,
             ffmpeg: Arc::new(Ffmpeg),
         });
@@ -1401,6 +1437,7 @@ mod tests {
             .await,
             Err(AppError::SttError(_))
         ));
+        assert_eq!(failing.closes.load(Ordering::SeqCst), 1);
         let checkpoint = checkpoint_file(directory.path());
         assert!(checkpoint.exists());
 

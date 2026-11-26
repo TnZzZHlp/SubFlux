@@ -163,6 +163,39 @@ pub struct SttConfig {
     pub chunk_overlap_seconds: u64,
 }
 
+pub const COLAB_STT_MODEL: &str = "large-v3";
+
+impl SttConfig {
+    pub fn uses_colab(&self) -> bool {
+        self.provider.eq_ignore_ascii_case("colab")
+            || self.provider.eq_ignore_ascii_case("google-colab-t4")
+    }
+
+    pub const fn colab_chunk_seconds(&self) -> u64 {
+        if self.chunk_seconds > 300 {
+            300
+        } else {
+            self.chunk_seconds
+        }
+    }
+
+    pub(crate) fn normalize_colab(&mut self) -> Result<()> {
+        if self.uses_colab() {
+            self.chunk_seconds = self.colab_chunk_seconds();
+            if self.chunk_overlap_seconds >= self.chunk_seconds {
+                return Err(AppError::InvalidConfig(
+                    "Colab STT overlap must be shorter than its chunk duration (maximum 300 seconds)"
+                        .into(),
+                ));
+            }
+            self.provider = "google-colab-t4".into();
+            self.model = COLAB_STT_MODEL.into();
+            self.base_url.clear();
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub translator: TranslatorConfig,

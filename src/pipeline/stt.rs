@@ -1,8 +1,12 @@
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::warn;
+
 use crate::{
     config::LanguageCode,
     error::Result,
+    event::TaskEvent,
     media::AudioChunk,
-    stt::SttResult,
+    stt::{SttProvider, SttResult},
     subtitle::{SpeechSegment, SubtitleDocument},
 };
 
@@ -10,6 +14,19 @@ use crate::{
 /// same document type used by embedded/external subtitles.
 pub fn document_from_stt_result(result: SttResult) -> Result<SubtitleDocument> {
     SubtitleDocument::from_speech_segments(result.segments, result.language)
+}
+
+pub(super) async fn close_provider(
+    provider: Option<&dyn SttProvider>,
+    events: &UnboundedSender<TaskEvent>,
+) {
+    if let Some(provider) = provider
+        && let Err(error) = provider.close().await
+    {
+        let message = error.safe_message();
+        warn!(error = %message, "STT provider cleanup failed");
+        let _ = events.send(TaskEvent::Warning(message));
+    }
 }
 
 /// Collects local timestamped responses from overlapping audio chunks and

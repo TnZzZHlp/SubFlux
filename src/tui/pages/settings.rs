@@ -6,7 +6,10 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
-use crate::app::{App, ReloadStatus};
+use crate::{
+    app::{App, ReloadStatus},
+    config::COLAB_STT_MODEL,
+};
 
 use super::super::ui::LayoutMode;
 use crate::tui::ui::truncate_text;
@@ -18,18 +21,14 @@ pub(crate) fn render(frame: &mut Frame, app: &App, area: Rect, mode: LayoutMode)
         compact_lines(app, usize::from(area.width.saturating_sub(4)))
     };
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(" 配置诊断 / 只读 ")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(lines).block(Block::default().title(" 配置诊断 ").borders(Borders::ALL)),
         area,
     );
 }
 
 fn full_lines(app: &App) -> Vec<Line<'static>> {
     let config = &app.config;
-    vec![
+    let mut lines = vec![
         section("翻译服务"),
         Line::from(format!(
             "  接口：{} / {}",
@@ -49,13 +48,25 @@ fn full_lines(app: &App) -> Vec<Line<'static>> {
             config.translator.max_retries
         )),
         section("语音识别"),
-        Line::from(format!("  服务：{}", config.stt.provider)),
-        Line::from(format!("  端点：{}", config.stt.base_url)),
-        Line::from(format!("  模型：{}", config.stt.model)),
-        Line::from(format!("  API 密钥：{}", config.stt.api_key.masked())),
+    ];
+    let chunk_seconds = if config.stt.uses_colab() {
+        lines.push(Line::from(format!(
+            "  服务：Colab T4 / Whisper {COLAB_STT_MODEL}"
+        )));
+        config.stt.colab_chunk_seconds()
+    } else {
+        lines.extend([
+            Line::from(format!("  服务：{}", config.stt.provider)),
+            Line::from(format!("  端点：{}", config.stt.base_url)),
+            Line::from(format!("  模型：{}", config.stt.model)),
+            Line::from(format!("  API 密钥：{}", config.stt.api_key.masked())),
+        ]);
+        config.stt.chunk_seconds
+    };
+    lines.extend([
         Line::from(format!(
-            "  分片 / 重叠：{} 秒 / {} 秒",
-            config.stt.chunk_seconds, config.stt.chunk_overlap_seconds
+            "  分片 / 重叠：{chunk_seconds} 秒 / {} 秒",
+            config.stt.chunk_overlap_seconds
         )),
         section("运行参数"),
         Line::from(format!(
@@ -64,12 +75,13 @@ fn full_lines(app: &App) -> Vec<Line<'static>> {
             config.batch_concurrency
         )),
         reload_line(&app.reload_status),
-    ]
+    ]);
+    lines
 }
 
 fn compact_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let config = &app.config;
-    vec![
+    let mut lines = vec![
         Line::from(truncate_text(
             &format!(
                 "翻译：{} / {} / {}",
@@ -78,13 +90,23 @@ fn compact_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             width,
         )),
         Line::from(format!("翻译密钥：{}", config.translator.api_key.masked())),
-        Line::from(truncate_text(
-            &format!("语音识别：{} / {}", config.stt.provider, config.stt.model),
+    ];
+    if config.stt.uses_colab() {
+        lines.push(Line::from(truncate_text(
+            &format!("语音识别：Colab T4 / {COLAB_STT_MODEL}"),
             width,
-        )),
-        Line::from(format!("语音识别密钥：{}", config.stt.api_key.masked())),
-        reload_line(&app.reload_status),
-    ]
+        )));
+    } else {
+        lines.extend([
+            Line::from(truncate_text(
+                &format!("语音识别：{} / {}", config.stt.provider, config.stt.model),
+                width,
+            )),
+            Line::from(format!("语音识别密钥：{}", config.stt.api_key.masked())),
+        ]);
+    }
+    lines.push(reload_line(&app.reload_status));
+    lines
 }
 
 fn section(title: &str) -> Line<'static> {

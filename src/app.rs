@@ -93,6 +93,7 @@ pub struct ProcessingState {
     pub total: Option<usize>,
     pub request: Option<usize>,
     pub batch: Option<BatchProcessingState>,
+    pub warning: Option<String>,
 }
 
 impl Default for ProcessingState {
@@ -104,6 +105,7 @@ impl Default for ProcessingState {
             total: None,
             request: None,
             batch: None,
+            warning: None,
         }
     }
 }
@@ -387,6 +389,15 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('h' | 'H') => {
                 self.page = Page::Home;
+                Vec::new()
+            }
+            KeyCode::Char('c' | 'C') if self.reload_status != ReloadStatus::Loading => {
+                self.config.stt.provider = if self.config.stt.uses_colab() {
+                    "openai"
+                } else {
+                    "colab"
+                }
+                .into();
                 Vec::new()
             }
             KeyCode::Char('r' | 'R') if self.reload_status != ReloadStatus::Loading => {
@@ -1258,6 +1269,7 @@ impl App {
             | TaskEvent::BatchRetryCancelled
             | TaskEvent::ProbeSucceeded { .. }
             | TaskEvent::ProbeFailed { .. }
+            | TaskEvent::Warning(_)
             | TaskEvent::Finished(_)
             | TaskEvent::BatchFinished(_)
             | TaskEvent::Failed(_)
@@ -1442,6 +1454,7 @@ impl App {
                 });
             }
             TaskEvent::Writing => self.processing.stage = "正在写入字幕…".into(),
+            TaskEvent::Warning(message) => self.processing.warning = Some(message),
             TaskEvent::Finished(output) => {
                 self.clear_overwrite_prompts();
                 self.cancellation = None;
@@ -1541,8 +1554,10 @@ impl App {
         Vec::new()
     }
 
-    pub const fn source_mode_label(&self) -> &'static str {
+    pub fn source_mode_label(&self) -> &'static str {
         match self.source_mode {
+            SourceMode::Auto if self.config.stt.uses_colab() => "自动（无文本字幕时用 Colab T4）",
+            SourceMode::Stt if self.config.stt.uses_colab() => "语音识别（Colab T4）",
             SourceMode::Auto => "自动（文本字幕轨、关联外部字幕，否则语音识别）",
             SourceMode::Embedded => "指定内嵌字幕轨",
             SourceMode::External => "外部字幕文件",

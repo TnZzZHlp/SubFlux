@@ -18,6 +18,7 @@ use crate::{
 use super::{
     PipelineJob, SubtitleInput,
     job::{BatchOverwrite, run_pipeline_with_batch_overwrite},
+    stt::close_provider,
 };
 
 /// Subtitle sources that can be applied safely to every independently probed
@@ -71,7 +72,7 @@ pub async fn run_batch(
     let run_cancellation = cancellation.clone();
     let run_services = Arc::clone(&services);
     let batch_overwrite = BatchOverwrite::default();
-    let summary = run_batch_jobs(
+    let result = run_batch_jobs(
         &job,
         &cancellation,
         &events,
@@ -85,7 +86,9 @@ pub async fn run_batch(
             )
         },
     )
-    .await?;
+    .await;
+    close_provider(services.stt.as_deref(), &events).await;
+    let summary = result?;
 
     debug!(
         total = summary.total,

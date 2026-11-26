@@ -25,10 +25,32 @@ use subflux::{
     tui::{TuiTerminal, spawn_input},
 };
 
+mod cli;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
-    let startup_path = parse_startup_path(env::args_os().skip(1))?;
+    let mut arguments = env::args_os().skip(1).peekable();
+    match arguments.peek().and_then(|arg| arg.to_str()) {
+        Some("colab") => {
+            arguments.next();
+            if let Err(error) = cli::run(arguments).await {
+                eprintln!("{}", error.safe_message());
+                std::process::exit(if matches!(error, AppError::Cancelled) {
+                    130
+                } else {
+                    1
+                });
+            }
+            return Ok(());
+        }
+        Some("--help" | "-h") => {
+            println!("{}", cli::USAGE);
+            return Ok(());
+        }
+        _ => {}
+    }
+    let startup_path = parse_startup_path(arguments)?;
     let (config, config_problem) = match Config::load() {
         Ok(config) => (config, None),
         Err(error) => (

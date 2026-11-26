@@ -1,3 +1,4 @@
+pub mod colab;
 pub mod model;
 pub mod openai;
 pub mod provider;

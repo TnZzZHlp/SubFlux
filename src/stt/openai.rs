@@ -118,6 +118,16 @@ fn api_error(status: u16, request_id: Option<&str>, bytes: &[u8], secret: &str) 
 }
 
 pub(crate) fn parse_verbose_json(bytes: &[u8]) -> Result<SttResult> {
+    let result = decode_verbose_json(bytes)?;
+    if result.segments.is_empty() {
+        return Err(AppError::SttError(
+            "STT response has no timestamped segments; verbose_json segments are required".into(),
+        ));
+    }
+    Ok(result)
+}
+
+pub(super) fn decode_verbose_json(bytes: &[u8]) -> Result<SttResult> {
     let response: VerboseResponse = serde_json::from_slice(bytes).map_err(|error| {
         AppError::InvalidApiResponse(format!("invalid STT verbose_json response: {error}"))
     })?;
@@ -126,11 +136,6 @@ pub(crate) fn parse_verbose_json(bytes: &[u8]) -> Result<SttResult> {
         segments: response_segments,
         words,
     } = response;
-    if response_segments.is_empty() {
-        return Err(AppError::SttError(
-            "STT response has no timestamped segments; verbose_json segments are required".into(),
-        ));
-    }
     let word_starts = words
         .into_iter()
         .enumerate()
